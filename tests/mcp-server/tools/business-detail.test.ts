@@ -380,6 +380,120 @@ describe('chparl_get_business', () => {
     expectBusinessParity(result);
   });
 
+  it.each(relationCases)(
+    'fits and completely continues 100 full $section rows on both surfaces',
+    async ({ section, row, expected, key }) => {
+      const longField =
+        section === 'status_history'
+          ? 'BusinessStatusName'
+          : section === 'related_business'
+            ? 'RelatedBusinessTitle'
+            : section === 'preconsultations'
+              ? 'CommitteeName'
+              : 'Title';
+      const outputField =
+        section === 'status_history'
+          ? 'statusName'
+          : section === 'preconsultations'
+            ? 'committeeName'
+            : 'title';
+      const rows = Array.from({ length: 100 }, (_, index) => ({
+        ...row,
+        Language: 'DE',
+        BusinessNumber: 20991234,
+        ...(section === 'subjects'
+          ? { IdSubject: String(9007199254740993n + BigInt(index)) }
+          : { ID: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}` }),
+        [longField]: `<p>${'界'.repeat(200)}\r\n${index}</p>`,
+      }));
+      const expectedRows = rows.map((_, index) => {
+        const id = `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`;
+        return {
+          ...expected,
+          ...(section === 'subjects'
+            ? { subjectId: String(9007199254740993n + BigInt(index)) }
+            : { id }),
+          ...(section === 'bills'
+            ? {
+                sourceUrl: `https://ws.parlament.ch/odata.svc/Bill(ID=guid'${id}',Language='DE')?$format=json`,
+              }
+            : {}),
+          [outputField]: `<p>${'界'.repeat(200)}\r\n${index}</p>`,
+        };
+      });
+      http.reset();
+      http.route({
+        match: () => true,
+        respond: (request) => {
+          const url = new URL(request.url);
+          if (url.pathname.includes('Business(')) return Response.json({ d: businessRow });
+          const offset = Number(url.searchParams.get('$skip'));
+          return Response.json({
+            d: {
+              results: rows.slice(offset, offset + Number(url.searchParams.get('$top'))),
+              __count: '100',
+            },
+          });
+        },
+      });
+      const collected: unknown[] = [];
+      let offset = 0;
+      for (;;) {
+        const result = await runToolContract(getBusinessTool, {
+          businessId: '20991234',
+          section,
+          limit: offset === 0 ? 101 : 100,
+          offset,
+        });
+        expect(result.isError).not.toBe(true);
+        const items = getBusinessTool.output.parse(result.structuredContent)[key] ?? [];
+        expect(items).toEqual(expectedRows.slice(offset, offset + items.length));
+        expect(items.length).toBeGreaterThan(0);
+        expect(result.structuredContent).toMatchObject({
+          effectiveLimit: 100,
+          returnedCount: items.length,
+          totalCount: 100,
+          hasMore: offset + items.length < 100,
+        });
+        expect(
+          new TextEncoder().encode(
+            JSON.stringify({
+              structuredContent: result.structuredContent,
+              content: result.content,
+            }),
+          ).byteLength,
+        ).toBeLessThan(24_000);
+        expectBusinessParity(result);
+        collected.push(...items);
+        offset += items.length;
+        if (offset === 100) {
+          expect(result.structuredContent).not.toHaveProperty('nextOffset');
+          break;
+        }
+        expect(result.structuredContent).toMatchObject({
+          nextOffset: offset,
+          notice: expect.stringContaining('whole'),
+        });
+      }
+      expect(collected).toEqual(expectedRows);
+      expect(new URL(http.calls[1]?.request.url ?? '').searchParams.get('$top')).toBe('100');
+      const pastEnd = await runToolContract(getBusinessTool, {
+        businessId: '20991234',
+        section,
+        limit: 100,
+        offset: 100,
+      });
+      expect(pastEnd.structuredContent).toMatchObject({
+        [key]: [],
+        totalCount: 100,
+        returnedCount: 0,
+        hasMore: false,
+      });
+      expect(pastEnd.structuredContent).not.toHaveProperty('nextOffset');
+      expectBusinessParity(pastEnd);
+    },
+  );
+
   it('returns every original text field and HTML reference without rewriting its bytes', async () => {
     const html =
       '<p>α\r\n\t``` <a href="https://example.test/a?x=1&amp;y=2">A</a><img src="https://example.test/image.png" alt="Icon [x]"><a href="/relative">R</a><a href="javascript:alert(1)">X</a></p>';

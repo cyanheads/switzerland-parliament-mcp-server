@@ -36,7 +36,7 @@ export const BusinessTextReferenceSchema = z
   .object({
     kind: z.enum(['link', 'image']).describe('HTML link or image reference.'),
     originalUrl: z.string().describe('Original reference attribute value, before HTML decoding.'),
-    label: z.string().optional().describe('Original image alt attribute or link inner markup.'),
+    label: z.string().optional().describe('Original image alt attribute, when present.'),
     url: z
       .string()
       .optional()

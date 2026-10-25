@@ -154,18 +154,11 @@ export async function searchBusiness(
     ID: z.guid(),
     Language: z.enum(['DE', 'FR', 'IT']),
     BusinessNumber: z.number().int().positive().max(2_147_483_647),
-    Businesses: RawBusinessSchema,
   });
   const base: ODataQuery = {
     entity: 'BusinessRole',
     language: filters.language,
-    select: [
-      'ID',
-      'Language',
-      'BusinessNumber',
-      ...BUSINESS_SUMMARY_FIELDS.map((field) => `Businesses/${field}`),
-    ],
-    expand: ['Businesses'],
+    select: ['ID', 'Language', 'BusinessNumber'],
     orderBy: [
       { field: 'BusinessNumber', direction: 'desc' },
       { field: 'ID', direction: 'asc' },
@@ -183,37 +176,63 @@ export async function searchBusiness(
     { limit: filters.limit, offset: 0 },
     workflow,
   );
-  const businesses = new Map<string, BusinessSummary>();
+  const businessIds = new Set<number>();
   for (const row of page.items) {
-    if (row.Language !== filters.language.toUpperCase() || row.BusinessNumber !== row.Businesses.ID)
-      throw serializationError('Parliament returned a mismatched committee role expansion.');
-    const business = normalizeBusiness(row.Businesses, filters.language);
-    if (!businesses.has(business.businessId)) businesses.set(business.businessId, business);
+    if (row.Language !== filters.language.toUpperCase())
+      throw serializationError(
+        'Parliament returned a committee role in a different metadata language.',
+      );
+    businessIds.add(row.BusinessNumber);
   }
-  const items = [...businesses.values()];
-  const smallest = items.at(-1)?.businessId;
-  const older =
-    smallest === undefined
-      ? undefined
-      : await client.collection(
-          {
-            ...base,
-            filter: [...predicates, `BusinessNumber lt ${odataInt32(smallest)}`].join(' and '),
-          },
-          roleSchema,
-          { limit: 1, offset: 0 },
-          workflow,
+  const ids = [...businessIds].sort((a, b) => b - a);
+  const businesses = new Map<number, BusinessSummary>();
+  // Fifty full-summary IDs fit the source's query-string limit; 100 IDs return HTTP 404.
+  for (let start = 0; start < ids.length; start += 50) {
+    const batch = ids.slice(start, start + 50);
+    const expected = new Set(batch);
+    const summaries = await client.collection(
+      {
+        entity: 'Business',
+        language: filters.language,
+        select: BUSINESS_SUMMARY_FIELDS,
+        orderBy: [{ field: 'ID', direction: 'desc' }],
+        filter: batch.map((id) => `ID eq ${odataInt32(String(id))}`).join(' or '),
+      },
+      RawBusinessSchema,
+      { limit: batch.length, offset: 0 },
+      workflow,
+    );
+    for (const row of summaries.items) {
+      if (!expected.has(row.ID) || businesses.has(row.ID))
+        throw serializationError(
+          'Parliament returned an unexpected or duplicate committee business summary.',
         );
-  if (older)
-    for (const row of older.items) {
-      if (
-        row.Language !== filters.language.toUpperCase() ||
-        row.BusinessNumber !== row.Businesses.ID ||
-        row.Businesses.Language !== filters.language.toUpperCase()
-      )
-        throw serializationError('Parliament returned a mismatched committee sentinel.');
+      businesses.set(row.ID, normalizeBusiness(row, filters.language));
     }
-  return { items, hasMore: older !== undefined && older.items.length > 0 };
+    if (summaries.items.length !== batch.length)
+      throw serializationError(
+        'Parliament omitted a requested committee business summary. Retry the search.',
+      );
+  }
+  const items = [...businesses.values()].sort(
+    (a, b) => Number(b.businessId) - Number(a.businessId),
+  );
+  const smallest = ids.at(-1);
+  if (smallest === undefined) return { items, hasMore: false };
+  const older = await client.collection(
+    {
+      ...base,
+      filter: [...predicates, `BusinessNumber lt ${odataInt32(String(smallest))}`].join(' and '),
+    },
+    roleSchema,
+    { limit: 1, offset: 0 },
+    workflow,
+  );
+  for (const row of older.items) {
+    if (row.Language !== filters.language.toUpperCase() || row.BusinessNumber >= smallest)
+      throw serializationError('Parliament returned a mismatched committee sentinel.');
+  }
+  return { items, hasMore: older.items.length > 0 };
 }
 
 /** Build overview metadata and availability without putting large text into the overview. */

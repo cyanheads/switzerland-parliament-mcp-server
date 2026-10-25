@@ -44,7 +44,7 @@ export const searchBusinessTool = tool('chparl_search_business', {
       'Submission session ID from chparl_list_reference topic sessions.',
     ),
     committeeId: optionalString(Int32IdSchema).describe(
-      'Committee number matched through any published BusinessRole.',
+      'Committee number from chparl_list_reference topic committees; matches any published committee role.',
     ),
     submittedFrom: optionalString(IsoDaySchema).describe(
       'Inclusive submission-date lower bound, YYYY-MM-DD.',

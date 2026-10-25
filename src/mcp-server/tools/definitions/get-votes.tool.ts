@@ -33,6 +33,7 @@ import {
 } from '@/services/parliament/vote-service.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import {
+  COLLECTION_RESULT_LIMIT_BYTES,
   completeResultBytes,
   fitCollectionPage,
   formatParliamentResult,
@@ -145,13 +146,13 @@ export const getVotesTool = tool('chparl_get_votes', {
       'Workflow: votes (default), members, or complete groups.',
     ),
     businessId: optionalString(BusinessIdentifierSchema).describe(
-      'Votes only: canonical eight-digit business ID or published short number, such as 99.1234.',
+      'Votes only: canonical eight-digit businessId from chparl_search_business, or a published short number such as 99.1234.',
     ),
     voteId: optionalString(Int32IdSchema).describe(
       'Members or groups only: positive Int32 Vote.ID discovered through votes mode.',
     ),
     personNumber: optionalString(Int32IdSchema).describe(
-      'Members only: exact PersonNumber, not Person.ID or current group affiliation.',
+      'Members only: exact PersonNumber from chparl_search_members, distinct from Person.ID or current group affiliation.',
     ),
     language: LanguageSchema.describe(
       'Metadata language: de (default), fr, or it; decision text remains as published.',
@@ -192,7 +193,7 @@ export const getVotesTool = tool('chparl_get_votes', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'A required mode identifier is missing, identifiers conflict, or a filter or paging field belongs to another mode.',
       recovery:
-        'Use chparl_get_votes mode votes with businessId, or mode members or groups with voteId.',
+        'Use mode votes with businessId and no voteId; use mode members or groups with voteId and no businessId. Omit personNumber outside members and paging in groups.',
     },
     {
       reason: 'ambiguous_business_number',
@@ -339,7 +340,7 @@ export const getVotesTool = tool('chparl_get_votes', {
               'Member data is unavailable for this published vote. No complete zero-vote totals can be inferred; use chparl_search_transcripts for published vote announcements.',
           }),
         };
-        if (completeResultBytes(output, enrichment) >= 24_000)
+        if (completeResultBytes(output, enrichment) >= COLLECTION_RESULT_LIMIT_BYTES)
           enrichment.notice = `${enrichment.notice === undefined ? '' : `${enrichment.notice} `}The complete indivisible group aggregate or its provenance exceeds 24000 bytes. This is the exact chparl_get_votes mode=groups, voteId=${input.voteId}, language=${input.language} result; all groups and counts are retained.`;
         ctx.enrich(enrichment);
         return output;

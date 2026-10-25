@@ -102,7 +102,7 @@ export const listReferenceTool = tool('chparl_list_reference', {
     {
       reason: 'incompatible_fields',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Session dates were supplied for another reference topic.',
+      when: 'Session dates were supplied for another topic, or dateFrom is after dateTo.',
       recovery: 'Use chparl_list_reference with topic sessions before supplying date filters.',
     },
     {

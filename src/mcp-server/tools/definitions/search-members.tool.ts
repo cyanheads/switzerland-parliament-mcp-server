@@ -26,7 +26,7 @@ const service = new MemberService();
 /** Find affiliation records with stable paging and unchanged source names and labels. */
 export const searchMembersTool = tool('chparl_search_members', {
   description:
-    'Find current or former Swiss Parliament member records by name, council, canton, party, or parliamentary group. membership defaults to current; former selects inactive records and all omits the activity filter. query is an upstream substring on FirstName, LastName, or OfficialName. Results are MemberCouncil affiliation records; use their personNumber with chparl_get_member for identity, full council terms, committees, and declared interests. Follow nextOffset with the same filters.',
+    'Find current or former Swiss Parliament affiliation records by name, council, canton, party, or parliamentary group. membership defaults to current; former selects inactive records and all omits the activity filter. query matches a substring of a published first, last, or official name. Use each record’s personNumber with chparl_get_member for identity, full council terms, committees, and declared interests. Follow nextOffset with the same filters.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     query: optionalString(z.string()).describe(

@@ -22,6 +22,7 @@ import {
 import { getTranscript, searchTranscripts } from '@/services/parliament/transcript-service.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import {
+  COLLECTION_RESULT_LIMIT_BYTES,
   completeResultBytes,
   fitCollectionPage,
   formatParliamentResult,
@@ -100,16 +101,16 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
       'Metadata language: de (default), fr, or it; original passage text stays in its published language.',
     ),
     businessId: optionalString(BusinessIdentifierSchema).describe(
-      'Canonical eight-digit business ID or published short number; incompatible with subjectId and transcriptId.',
+      'Canonical eight-digit businessId from chparl_search_business or published short number; incompatible with subjectId and transcriptId.',
     ),
     subjectId: optionalString(Int64IdSchema).describe(
       'Positive Int64 debate IdSubject string; incompatible with businessId and transcriptId.',
     ),
     transcriptId: optionalString(Int64IdSchema).describe(
-      'Exact positive Int64 Transcript.ID string; only language and includeText may accompany it.',
+      'Exact positive Int64 transcriptId from a previous chparl_search_transcripts result; only language and includeText may accompany it.',
     ),
     personNumber: optionalString(Int32IdSchema).describe(
-      'Exact speaker PersonNumber, distinct from Person.ID.',
+      'Exact speaker PersonNumber from chparl_search_members, distinct from Person.ID.',
     ),
     sessionId: optionalString(Int32IdSchema).describe(
       'Exact positive decimal session identifier from chparl_list_reference topic sessions.',
@@ -188,7 +189,7 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'Business and subject are combined, or an exact passage ID is combined with search filters or paging.',
       recovery:
-        'Call chparl_search_transcripts with either transcriptId or a single business or subject search scope.',
+        'For an exact passage, keep only transcriptId, language, and includeText; for searches, omit transcriptId and choose at most one of businessId and subjectId.',
     },
     {
       reason: 'ambiguous_business_number',
@@ -287,7 +288,7 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
           provenance: provenance(workflow.sources),
         };
         const enrichment: z.infer<typeof EnrichmentSchema> = { effectiveFilters: filters };
-        if (completeResultBytes(output, enrichment) >= 24_000)
+        if (completeResultBytes(output, enrichment) >= COLLECTION_RESULT_LIMIT_BYTES)
           enrichment.notice = `This indivisible passage or its provenance exceeds 24000 bytes and is returned whole. Retrieve it with chparl_search_transcripts arguments ${JSON.stringify({ transcriptId: input.transcriptId, language: input.language, includeText })}.`;
         ctx.enrich(enrichment);
         return output;

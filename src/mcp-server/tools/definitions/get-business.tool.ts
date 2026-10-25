@@ -67,7 +67,7 @@ export const getBusinessTool = tool('chparl_get_business', {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     businessId: BusinessIdentifierSchema.describe(
-      'Canonical eight-digit Business.ID or exact published BusinessShortNumber, such as 20991234 or 99.1234.',
+      'Canonical eight-digit businessId from chparl_search_business, or an exact published short number such as 99.1234.',
     ),
     language: LanguageSchema.describe(
       'Metadata and business-text variant: de (default), fr, or it.',

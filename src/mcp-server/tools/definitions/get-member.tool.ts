@@ -20,6 +20,7 @@ import type { ODataPage } from '@/services/parliament/odata-client.js';
 import { ProvenanceSchema, provenance } from '@/services/parliament/provenance.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import {
+  COLLECTION_RESULT_LIMIT_BYTES,
   completeResultBytes,
   fitCollectionPage,
   formatParliamentResult,
@@ -216,7 +217,7 @@ export const getMemberTool = tool('chparl_get_member', {
           completeResultBytes(output, {
             ...enrichment,
             ...(notices.length > 0 && { notice: notices.join(' ') }),
-          }) >= 24_000
+          }) >= COLLECTION_RESULT_LIMIT_BYTES
         )
           notices.push(
             'This complete unpaged overview exceeds 24000 bytes. All base affiliations are returned whole; use chparl_get_member section council_terms for independently paged historical terms.',

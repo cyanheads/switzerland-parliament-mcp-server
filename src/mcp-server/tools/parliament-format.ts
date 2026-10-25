@@ -8,6 +8,8 @@ import { escapeMarkdownInline, markdownImage, markdownLink } from '@cyanheads/mc
 /** At-the-max collection replies fit below this complete MCP-result byte size. */
 export const COLLECTION_RESULT_LIMIT_BYTES = 24_000;
 
+const encoder = new TextEncoder();
+
 /** Render a string whose JSON decoding preserves CR/LF, raw HTML, and control characters exactly. */
 export function renderOriginalString(value: string): string {
   if (
@@ -68,7 +70,7 @@ export function completeResultBytes(output: object, enrichment: object): number 
     .join('\n');
   const content = formatParliamentResult(output);
   if (trailer) content.push({ type: 'text', text: `\n\n${trailer}` });
-  return new TextEncoder().encode(
+  return encoder.encode(
     JSON.stringify({ structuredContent: { ...output, ...enrichment }, content }),
   ).byteLength;
 }
@@ -91,14 +93,13 @@ export function fitCollectionPage<T, D extends object, E extends object>(
 ): PreparedPage<D, E> {
   let count = items.length;
   let page = build([...items], false, false);
-  while (
-    completeResultBytes(page.output, page.enrichment) >= COLLECTION_RESULT_LIMIT_BYTES &&
-    count > 1
-  ) {
+  let sizeBytes = completeResultBytes(page.output, page.enrichment);
+  while (sizeBytes >= COLLECTION_RESULT_LIMIT_BYTES && count > 1) {
     count--;
     page = build(items.slice(0, count), true, false);
+    sizeBytes = completeResultBytes(page.output, page.enrichment);
   }
-  if (completeResultBytes(page.output, page.enrichment) >= COLLECTION_RESULT_LIMIT_BYTES) {
+  if (sizeBytes >= COLLECTION_RESULT_LIMIT_BYTES) {
     page = build(items.slice(0, count), count < items.length, true);
   }
   return page;

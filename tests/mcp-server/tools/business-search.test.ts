@@ -5,7 +5,7 @@
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { searchBusinessTool } from '@/mcp-server/tools/definitions/search-business.tool.js';
 import {
   businessNextCursor,
@@ -21,7 +21,10 @@ beforeEach(() => {
     throw new Error('Unexpected Parliament request.');
   });
 });
-afterEach(() => http.restore());
+afterEach(() => {
+  http.restore();
+  vi.useRealTimers();
+});
 
 function serve(body: unknown) {
   http.reset();
@@ -41,6 +44,89 @@ const clauses =
   "substringof('O''Brien é',Title) and substringof('A & B',SubmittedBy) and BusinessType eq 3 and BusinessStatus eq 9999 and SubmissionSession eq 50 and SubmissionDate ge datetime'2026-01-01T00:00:00' and SubmissionDate le datetime'2026-02-28T23:59:59.999'";
 
 describe('chparl_search_business', () => {
+  it('hydrates exact-date committee identifiers without expanding the slow role query', async () => {
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) => {
+        const url = new URL(request.url);
+        if (url.pathname === '/odata.svc/Business')
+          return Response.json({
+            d: {
+              results: [
+                { ...businessRow, ID: 20264707 },
+                { ...businessRow, ID: 20264708 },
+              ],
+              __count: '2',
+            },
+          });
+        if (
+          url.searchParams.has('$expand') ||
+          url.searchParams.get('$select')?.includes('Businesses/')
+        )
+          return Response.json(
+            { error: 'Role summary expansion is unavailable.' },
+            { status: 400 },
+          );
+        return Response.json({
+          d: {
+            results: url.searchParams.get('$filter')?.includes('BusinessNumber lt')
+              ? []
+              : [
+                  {
+                    ID: '00000000-0000-4000-8000-000000000001',
+                    Language: 'DE',
+                    BusinessNumber: 20264708,
+                  },
+                  {
+                    ID: '00000000-0000-4000-8000-000000000002',
+                    Language: 'DE',
+                    BusinessNumber: 20264707,
+                  },
+                ],
+            __count: url.searchParams.get('$filter')?.includes('BusinessNumber lt') ? '0' : '2',
+          },
+        });
+      },
+    });
+    const result = await runToolContract(searchBusinessTool, {
+      committeeId: '4',
+      submittedFrom: '2026-10-21',
+      submittedTo: '2026-10-21',
+      limit: 100,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      businesses: [
+        {
+          ...businessSummary,
+          businessId: '20264708',
+          sourceUrl:
+            "https://ws.parlament.ch/odata.svc/Business(ID=20264708,Language='DE')?$format=json",
+        },
+        {
+          ...businessSummary,
+          businessId: '20264707',
+          sourceUrl:
+            "https://ws.parlament.ch/odata.svc/Business(ID=20264707,Language='DE')?$format=json",
+        },
+      ],
+      returnedCount: 2,
+      hasMore: false,
+    });
+    expect(result.structuredContent).not.toHaveProperty('totalCount');
+    expect(result.structuredContent).toMatchObject({
+      provenance: {
+        sources: [
+          { url: expect.stringContaining('/BusinessRole?') },
+          { url: expect.stringContaining('/Business?') },
+          { url: expect.stringContaining('/BusinessRole?') },
+        ],
+      },
+    });
+    expectBusinessParity(result);
+  });
+
   it('maps a normalized conjunction and preserves every selected source value on both surfaces', async () => {
     serve({ d: { results: [businessRow], __count: '1' } });
     const result = await runToolContract(searchBusinessTool, { ...conjunction, language: ' DE ' });
@@ -121,6 +207,16 @@ describe('chparl_search_business', () => {
       match: () => true,
       respond: (request) => {
         const url = new URL(request.url);
+        if (url.pathname === '/odata.svc/Business')
+          return Response.json({
+            d: {
+              results: [
+                { ID: 20991233, Language: 'DE' },
+                { ID: 20991234, Language: 'DE' },
+              ],
+              __count: '2',
+            },
+          });
         if (url.searchParams.get('$filter')?.includes('BusinessNumber lt')) {
           return Response.json({
             d: { results: [role('00000000-0000-4000-8000-000000000005', 20991232)], __count: '9' },
@@ -146,20 +242,21 @@ describe('chparl_search_business', () => {
       notice: expect.stringContaining('distinct business total is unavailable'),
     });
     expect(result.structuredContent).not.toHaveProperty('totalCount');
-    expect(http.calls).toHaveLength(3);
+    expect(http.calls).toHaveLength(4);
     const urls = http.calls.map((call) => new URL(call.request.url));
     const filter = urls[0]?.searchParams.get('$filter');
     expect(filter).toBe(
       `Language eq 'DE' and (CommitteeNumber eq 7 and Businesses/Language eq 'DE' and ${clauses.replaceAll(',Title)', ',Businesses/Title)').replaceAll(',SubmittedBy)', ',Businesses/SubmittedBy)').replaceAll('BusinessType eq', 'Businesses/BusinessType eq').replaceAll('BusinessStatus eq', 'Businesses/BusinessStatus eq').replaceAll('SubmissionSession eq', 'Businesses/SubmissionSession eq').replaceAll('SubmissionDate ', 'Businesses/SubmissionDate ')})`,
     );
-    expect(urls[0]?.searchParams.get('$expand')).toBe('Businesses');
+    expect(urls[0]?.searchParams.has('$expand')).toBe(false);
+    expect(urls[0]?.searchParams.get('$select')).toBe('ID,Language,BusinessNumber');
     expect(urls[0]?.searchParams.get('$orderby')).toBe('BusinessNumber desc,ID asc');
     expect(urls[1]?.searchParams.get('$skip')).toBe('2');
     expect(urls[1]?.searchParams.get('$top')).toBe('1');
-    expect(urls[2]?.searchParams.get('$filter')).toBe(
+    expect(urls[3]?.searchParams.get('$filter')).toBe(
       filter?.replace(/\)$/, ' and BusinessNumber lt 20991233)'),
     );
-    expect(urls[2]?.searchParams.get('$top')).toBe('1');
+    expect(urls[3]?.searchParams.get('$top')).toBe('1');
     const cursor = businessNextCursor(result);
     expect(typeof cursor).toBe('string');
     if (typeof cursor !== 'string') throw new Error('Expected nextCursor.');
@@ -228,6 +325,87 @@ describe('chparl_search_business', () => {
     expect(textContent(result)).toContain('clamped to 100');
     expect(textContent(result)).toContain('no business fields were shortened');
     expectBusinessParity(result);
+  });
+
+  it('batches 100 committee candidates and drains fitted continuations across a duplicate boundary', async () => {
+    const ids = Array.from({ length: 101 }, (_, index) => 20991234 - index);
+    const candidates = [...ids.slice(0, 99), 20991136, ...ids.slice(99)].map((id, index) => ({
+      ID: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+      Language: 'DE',
+      BusinessNumber: id,
+    }));
+    const batchSizes: number[] = [];
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) => {
+        const url = new URL(request.url);
+        const filter = url.searchParams.get('$filter') ?? '';
+        const skip = Number(url.searchParams.get('$skip'));
+        const top = Number(url.searchParams.get('$top'));
+        if (url.pathname === '/odata.svc/Business') {
+          const selected = [...filter.matchAll(/ID eq (\d+)/g)].map((match) => Number(match[1]));
+          batchSizes.push(selected.length);
+          expect(url.href.length).toBeLessThan(2048);
+          return Response.json({
+            d: {
+              results: selected
+                .slice()
+                .reverse()
+                .slice(skip, skip + Math.min(top, 25))
+                .map((ID) => ({ ID, Language: 'DE', Title: `Business ${ID}` })),
+              __count: String(selected.length),
+            },
+          });
+        }
+        expect(url.searchParams.has('$expand')).toBe(false);
+        expect(url.searchParams.get('$select')).toBe('ID,Language,BusinessNumber');
+        expect(filter).toContain("CommitteeNumber eq 7 and Businesses/Language eq 'DE'");
+        const after = /BusinessNumber lt (\d+)/.exec(filter)?.[1];
+        const selected = candidates.filter(
+          (candidate) => after === undefined || candidate.BusinessNumber < Number(after),
+        );
+        return Response.json({
+          d: { results: selected.slice(skip, skip + top), __count: String(selected.length) },
+        });
+      },
+    });
+    const collected: string[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const result = await runToolContract(searchBusinessTool, {
+        committeeId: '7',
+        limit: cursor ? 100 : 101,
+        ...(cursor && { cursor }),
+      });
+      expect(result.isError).not.toBe(true);
+      const items = searchBusinessTool.output.parse(result.structuredContent).businesses;
+      expect(items.map((item) => item.businessId)).toEqual(
+        ids.slice(collected.length, collected.length + items.length).map(String),
+      );
+      expect(result.structuredContent).not.toHaveProperty('totalCount');
+      expect(result.structuredContent).toMatchObject({
+        returnedCount: items.length,
+        effectiveLimit: 100,
+        hasMore: collected.length + items.length < 101,
+      });
+      expect(
+        new TextEncoder().encode(
+          JSON.stringify({ structuredContent: result.structuredContent, content: result.content }),
+        ).byteLength,
+      ).toBeLessThan(24_000);
+      expectBusinessParity(result);
+      collected.push(...items.map((item) => item.businessId));
+      if (collected.length === 101) break;
+      expect(items.length).toBeGreaterThan(0);
+      cursor = businessNextCursor(result);
+      expect(JSON.parse(Buffer.from(cursor, 'base64url').toString())).toMatchObject({
+        lastBusinessId: String(ids[collected.length - 1]),
+      });
+    }
+    expect(collected).toEqual(ids.map(String));
+    expect(batchSizes).toContain(50);
+    expect(batchSizes.every((size) => size <= 50)).toBe(true);
   });
 
   it('returns a maximum small page and a whole indivisible oversized item', async () => {
@@ -367,41 +545,100 @@ describe('chparl_search_business', () => {
     expect(JSON.stringify(result)).not.toContain('private-stack');
   });
 
-  it('rejects mismatched committee expansions and sentinel rows without publishing fabricated items', async () => {
+  it.each([
+    { Language: 'FR' },
+    { ID: 'invalid-role-id' },
+    { BusinessNumber: 0 },
+    { BusinessNumber: 2_147_483_648 },
+  ])('rejects invalid committee role identity %o before hydration', async (mutation) => {
+    serve({
+      d: {
+        results: [
+          {
+            ID: '00000000-0000-4000-8000-000000000001',
+            Language: 'DE',
+            BusinessNumber: 20991234,
+            ...mutation,
+          },
+        ],
+        __count: '1',
+      },
+    });
+    const result = await runToolContract(searchBusinessTool, { committeeId: '7' });
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.SerializationError },
+    });
+    expect(result.isError).toBe(true);
+    expect(textContent(result)).toContain(
+      mutation.Language ? 'different metadata language' : 'documented fields',
+    );
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it.each([
+    { name: 'missing', rows: [], message: 'omitted a requested' },
+    {
+      name: 'unexpected ID',
+      rows: [{ ID: 20991233, Language: 'DE' }],
+      message: 'unexpected or duplicate',
+    },
+    {
+      name: 'wrong language',
+      rows: [{ ID: 20991234, Language: 'FR' }],
+      message: 'different metadata language',
+    },
+  ])('rejects $name hydration without silently advancing the cursor', async ({ rows, message }) => {
     const role = {
       ID: '00000000-0000-4000-8000-000000000001',
       Language: 'DE',
       BusinessNumber: 20991234,
-      Businesses: { ID: 20991233, Language: 'DE' },
     };
-    serve({ d: { results: [role], __count: '1' } });
-    const mismatch = await runToolContract(searchBusinessTool, { committeeId: '7' });
-    expect(mismatch.structuredContent).toMatchObject({
-      error: { code: JsonRpcErrorCode.SerializationError },
-    });
-    expect(textContent(mismatch)).toContain('mismatched committee role expansion');
     http.reset();
     http.route({
       match: () => true,
       respond: (request) =>
         Response.json({
           d: {
-            results: [
-              {
-                ...role,
-                Businesses: {
-                  ID: 20991234,
-                  Language: new URL(request.url).searchParams
-                    .get('$filter')
-                    ?.includes('BusinessNumber lt')
-                    ? 'FR'
-                    : 'DE',
-                },
-              },
-            ],
-            __count: '1',
+            results: new URL(request.url).pathname === '/odata.svc/Business' ? rows : [role],
+            __count: String(
+              new URL(request.url).pathname === '/odata.svc/Business' ? rows.length : 1,
+            ),
           },
         }),
+    });
+    const result = await runToolContract(searchBusinessTool, { committeeId: '7' });
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.SerializationError },
+    });
+    expect(textContent(result)).toContain(message);
+    expect(result.structuredContent).not.toHaveProperty('businesses');
+    expect(result.structuredContent).not.toHaveProperty('nextCursor');
+  });
+
+  it.each(['FR', 'DE'])('rejects a mismatched %s committee sentinel', async (language) => {
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) => {
+        const url = new URL(request.url);
+        return Response.json({
+          d: {
+            results:
+              url.pathname === '/odata.svc/Business'
+                ? [{ ID: 20991234, Language: 'DE' }]
+                : [
+                    {
+                      ID: '00000000-0000-4000-8000-000000000001',
+                      Language: url.searchParams.get('$filter')?.includes('BusinessNumber lt')
+                        ? language
+                        : 'DE',
+                      BusinessNumber: 20991234,
+                    },
+                  ],
+            __count: '1',
+          },
+        });
+      },
     });
     const sentinel = await runToolContract(searchBusinessTool, { committeeId: '7' });
     expect(sentinel.structuredContent).toMatchObject({
@@ -409,6 +646,86 @@ describe('chparl_search_business', () => {
     });
     expect(textContent(sentinel)).toContain('mismatched committee sentinel');
   });
+
+  it('rejects duplicate hydrated identities instead of losing another requested summary', async () => {
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) =>
+        Response.json({
+          d: {
+            results:
+              new URL(request.url).pathname === '/odata.svc/Business'
+                ? [
+                    { ID: 20991234, Language: 'DE' },
+                    { ID: 20991234, Language: 'DE' },
+                  ]
+                : [20991234, 20991233].map((BusinessNumber, index) => ({
+                    ID: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+                    Language: 'DE',
+                    BusinessNumber,
+                  })),
+            __count: '2',
+          },
+        }),
+    });
+    const result = await runToolContract(searchBusinessTool, { committeeId: '7' });
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.SerializationError },
+    });
+    expect(textContent(result)).toContain('unexpected or duplicate');
+  });
+
+  it.each(['deadline', 'cancel'] as const)(
+    'shares the workflow %s across role selection and hydration',
+    async (mode) => {
+      vi.useFakeTimers({ toFake: ['performance', 'setTimeout', 'clearTimeout'] });
+      const controller = new AbortController();
+      http.reset();
+      http.route({
+        match: () => true,
+        respond: (request) => {
+          if (new URL(request.url).pathname === '/odata.svc/Business') {
+            if (mode === 'deadline') vi.advanceTimersByTime(101);
+            else controller.abort(new DOMException('Stop hydration.', 'AbortError'));
+            return Response.json({
+              d: { results: [{ ID: 20991234, Language: 'DE' }], __count: '1' },
+            });
+          }
+          vi.advanceTimersByTime(44_900);
+          return Response.json({
+            d: {
+              results: [
+                {
+                  ID: '00000000-0000-4000-8000-000000000001',
+                  Language: 'DE',
+                  BusinessNumber: 20991234,
+                },
+              ],
+              __count: '1',
+            },
+          });
+        },
+      });
+      const result = await runToolContract(
+        searchBusinessTool,
+        { committeeId: '7' },
+        { context: { signal: controller.signal } },
+      );
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: mode === 'deadline' ? JsonRpcErrorCode.Timeout : JsonRpcErrorCode.RequestCancelled,
+          ...(mode === 'deadline'
+            ? { data: { reason: 'workflow_deadline_exceeded' } }
+            : { message: 'Stop hydration.' }),
+        },
+      });
+      expect(textContent(result)).toContain(
+        mode === 'deadline' ? 'workflow_deadline_exceeded' : 'Stop hydration.',
+      );
+      expect(http.calls).toHaveLength(2);
+    },
+  );
 
   it('settles caller cancellation before HTTP on both public surfaces', async () => {
     const result = await runToolContract(
@@ -444,9 +761,12 @@ describe('chparl_search_business', () => {
       respond: (request) =>
         Response.json({
           d: {
-            results: new URL(request.url).searchParams.get('$filter')?.includes('BusinessNumber lt')
-              ? []
-              : roles,
+            results:
+              new URL(request.url).pathname === '/odata.svc/Business'
+                ? roles.map((row) => row.Businesses)
+                : new URL(request.url).searchParams.get('$filter')?.includes('BusinessNumber lt')
+                  ? []
+                  : roles,
             __count: new URL(request.url).searchParams.get('$filter')?.includes('BusinessNumber lt')
               ? '0'
               : '20',
