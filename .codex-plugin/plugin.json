@@ -1,0 +1,25 @@
+{
+  "name": "switzerland-parliament-mcp-server",
+  "version": "0.1.0",
+  "description": "Search Swiss parliamentary business, votes, debates, members, and declared interests via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/switzerland-parliament-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/switzerland-parliament-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "ai-tools", "typescript", "cyanheads", "switzerland", "parliament", "curia-vista", "votes", "open-data"],
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "interface": {
+    "displayName": "switzerland-parliament-mcp-server",
+    "shortDescription": "Search Swiss parliamentary business, votes, debates, members, and declared interests via MCP. STDIO or Streamable HTTP.",
+    "longDescription": "Follow Swiss Federal Assembly motions and bills, inspect Nationalrat roll-call votes, read parliamentary debates in their original language, and look up members and their declared interests. Search official records in German, French, or Italian, with source attribution and retrieval dates.",
+    "developerName": "cyanheads",
+    "category": "research",
+    "capabilities": ["Read"],
+    "websiteURL": "https://github.com/cyanheads/switzerland-parliament-mcp-server",
+    "defaultPrompt": []
+  }
+}
