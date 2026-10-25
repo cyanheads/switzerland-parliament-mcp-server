@@ -6,10 +6,18 @@
   "author": "Casey Hand <casey@caseyjhand.com> (https://caseyjhand.com)",
   "homepage": "https://github.com/cyanheads/switzerland-parliament-mcp-server#readme",
   "funding": [
-    { "type": "github", "url": "https://github.com/sponsors/cyanheads" },
-    { "type": "buy_me_a_coffee", "url": "https://www.buymeacoffee.com/cyanheads" }
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/cyanheads"
+    },
+    {
+      "type": "buy_me_a_coffee",
+      "url": "https://www.buymeacoffee.com/cyanheads"
+    }
   ],
-  "bugs": { "url": "https://github.com/cyanheads/switzerland-parliament-mcp-server/issues" },
+  "bugs": {
+    "url": "https://github.com/cyanheads/switzerland-parliament-mcp-server/issues"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -44,6 +52,7 @@
     "changelog:build": "bun run scripts/build-changelog.ts",
     "changelog:check": "bun run scripts/build-changelog.ts --check",
     "release:github": "bun run scripts/release-github.ts",
+    "publish-mcp": "mcp-publisher login github -token \"$(security find-generic-password -a \"$USER\" -s mcp-publisher-github-pat -w)\" && mcp-publisher publish",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "start": "node dist/index.js",
@@ -79,6 +88,7 @@
   },
   "dependencies": {
     "@cyanheads/mcp-ts-core": "^0.13.16",
+    "entities": "^8.1.0",
     "pino-pretty": "^13.2.0",
     "zod": "^4.6.7"
   },
@@ -90,6 +100,7 @@
     "depcheck": "^1.4.7",
     "fast-check": "^4.10.2",
     "ignore": "^7.0.13",
+    "markdown-it": "^15.0.3",
     "tsc-alias": "^1.9.9",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
