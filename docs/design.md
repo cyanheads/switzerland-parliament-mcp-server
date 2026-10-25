@@ -1,6 +1,6 @@
 # switzerland-parliament-mcp-server — Design
 
-Version: 0.1.0. API behavior verified 2026-10-25.
+Version: 0.1.1. API behavior verified 2026-10-25.
 
 ## MCP Surface
 
@@ -34,7 +34,7 @@ Wrap the Swiss Federal Assembly's Curia Vista and Amtliches Bulletin data for pu
 - Preserve published strings, including HTML, `<pd_text>` markup, whitespace, line breaks, names, and decision labels. Selectors may omit named fields or pages; they never shorten the fields returned.
 - Identify the source and download date on every result, including empty results and missing-identifier outcomes. Describe the server as an unofficial reproduction. The [Parliament's conditions](https://www.parlament.ch/de/%C3%BCber-das-parlament/fakten-und-zahlen/open-data-web-services) require credit, an identifiable download date, unchanged content, and no impression of an official publication. Rights remain with the Parliamentary Services or authors; the terms do not grant additional rights in free text.
 - No published rate limit was found. Make bounded requests, honor rate limits if returned, and never infer an unlimited allowance. No API key, upstream URL override, translation service, or domain environment variables are required.
-- Retain version `0.1.0`. `createApp()` identity is `name` and `title`, both `switzerland-parliament-mcp-server`; do not add `websiteUrl` to the implementation plan.
+- Release version is `0.1.1`. `createApp()` identity is `name` and `title`, both `switzerland-parliament-mcp-server`; do not add `websiteUrl` to the implementation plan.
 
 Publish/install identity is `@cyanheads/switzerland-parliament-mcp-server` (including both plugin launch arguments and server.json package identifier); registry identity is `io.github.cyanheads/switzerland-parliament-mcp-server`; display/machine identity is the bare repository name. Canonical author is `Casey Hand <casey@caseyjhand.com> (https://caseyjhand.com)`. Package description is “Search Swiss parliamentary business, votes, debates, members, and declared interests via MCP. STDIO or Streamable HTTP.” Copy that description to README tagline, bundle/plugin manifests, Docker and GitHub metadata. The registry description stays within 100 characters and omits the transport suffix.
 
@@ -330,7 +330,7 @@ Use fake timers for timeout, retry, and deadline behavior; no sleeps or wall-clo
 
 ## Implementation Order
 
-1. Remove echo definitions and register the seven intended names as their waves land. Wire fixed service setup, exact `createApp` name/title, stateless posture, and instructions. Keep package/registry/display identity separate; version remains 0.1.0.
+1. Remove echo definitions and register the seven intended names as their waves land. Wire fixed service setup, exact `createApp` name/title, stateless posture, and instructions. Keep package/registry/display identity separate; release version is 0.1.1.
 2. Implement static reference topics first, including the faithfully transcribed status catalog with source snapshot date. Test output/provenance/rendering through tool contracts before other tools need their recovery routing.
 3. Implement the OData seam and live reference lists, then business search and business section retrieval. Test network envelopes, error redaction, keyed/short lookup, distinct committee paging, and large original text before adding downstream joins.
 4. Implement transcript search and the SubjectBusiness join. Test complete subject selection and the explicit narrowing boundary before live text-search field tests.

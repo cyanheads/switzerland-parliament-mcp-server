@@ -1,6 +1,6 @@
 # switzerland-parliament-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 13:38:32
+Generated on: 2026-10-25 13:54:17
 
 ```text
 switzerland-parliament-mcp-server/
@@ -24,6 +24,7 @@ switzerland-parliament-mcp-server/
 │   ├── extensions.json
 │   └── settings.json
 ├── changelog/
+│   ├── 0.1.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -211,6 +212,7 @@ switzerland-parliament-mcp-server/
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml
+├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
