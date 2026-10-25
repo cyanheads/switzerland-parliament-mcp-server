@@ -1,6 +1,8 @@
 .env*
 .DS_Store
 **/.DS_Store
+AGENTS.md
+CLAUDE.md
 .mcpregistry_*
 /.claude/
 /.agents/
@@ -16,6 +18,9 @@
 /coverage/
 /logs/
 /Dockerfile
+/.dockerignore
+/.gitattributes
+/devcheck.config.json
 /bun.lock
 /bunfig.toml
 /wrangler.toml
