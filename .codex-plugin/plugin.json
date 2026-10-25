@@ -10,7 +10,7 @@
   "homepage": "https://github.com/cyanheads/switzerland-parliament-mcp-server#readme",
   "repository": "https://github.com/cyanheads/switzerland-parliament-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "ai-tools", "typescript", "cyanheads", "switzerland", "parliament", "curia-vista", "votes", "open-data"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "ai-tools", "typescript", "bun", "stdio", "streamable-http", "cyanheads", "switzerland", "parliament", "curia-vista", "votes", "open-data"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "switzerland-parliament-mcp-server",
