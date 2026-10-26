@@ -2,9 +2,9 @@
 
 **Server:** switzerland-parliament-mcp-server
 **Version:** 0.1.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.16`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
+**MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -48,7 +48,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 All seven tools are read-only, idempotent public-source lookups. Definitions live in `src/mcp-server/tools/definitions/`, register directly in `src/index.ts`, and use `chparl_` names.
 
-`chparl_search_business` discovers canonical IDs; `chparl_get_business` reads one section at a time. `chparl_get_votes` selects a roll call before reading member decisions or complete group counts. `chparl_search_transcripts` joins business through debate subjects. Member workflows use `PersonNumber`, never assume it equals `Person.ID`.
+`chparl_search_business` discovers canonical IDs; `chparl_get_business` reads one section at a time. `chparl_get_votes` discovers roll calls by business/session, reads a person's voting history directly, or selects a roll call for member decisions and complete group counts. `chparl_search_transcripts` joins business through debate subjects. Member workflows use `PersonNumber`, never assume it equals `Person.ID`.
 
 `chparl_list_reference` resolves source codes before discovery. For example:
 
@@ -56,14 +56,15 @@ All seven tools are read-only, idempotent public-source lookups. Definitions liv
 {"topic":"sessions","language":"fr","limit":50}
 ```
 
-Its definition validates topic-specific dates, resolves effective filters, calls `getParliamentService().listReference` inside `withWorkflow`, fits complete rows with `fitCollectionPage`, and publishes the prepared enrichment through `ctx.enrich`. Use `formatParliamentResult` and `renderField` for both actual output and byte measurement. Keep every field and enrichment value on both `content[]` and `structuredContent`.
+Its definition validates topic-specific dates, resolves effective filters, calls `getParliamentService().listReference` inside `withWorkflow`, fits complete rows with `fitCollectionPage`, and publishes the prepared enrichment through `ctx.enrich`. Declare enrichment as one `EnrichmentSchema` object and pass `enrichmentTrailer: fieldTrailer(EnrichmentSchema.shape)`, so every trailer field renders through `renderField`. That, with `formatParliamentResult` for the domain block, keeps byte measurement equal to the actual output. Build notices with `joinNotices`, `clampNotice`, and `isPastEnd` from `parliament-format.ts`. Keep every field and enrichment value on both `content[]` and `structuredContent`.
 
 ### Source fidelity and pagination
 
 - Metadata language is `de`, `fr`, or `it`; it never translates Bulletin text. Preserve source strings, HTML, line endings, unknown codes, and absent values.
 - Every successful result carries `provenance` with attribution, source URLs, and actual download or snapshot dates.
 - Collection pages fit whole rows to the 24,000-byte complete-result budget. Preserve an indivisible oversized row with a notice; never shorten fields.
-- Business searches continue with `nextCursor`; other paged sections use `nextOffset` based on delivered rows. Committee pages count role candidates and omit a distinct business total.
+- Business searches continue with `nextCursor`; other paged sections use `nextOffset` based on delivered rows. Author searches omit counts and use one extra matching row; committee pages count role candidates and omit a distinct business total.
+- Vote rows use canonical `CantonNumber` for `cantonId` and retain source `Voting.CantonID` as `votingCantonId`. Decision buckets preserve all distinct published labels in `decisionTexts`, including unknown codes.
 - Business text selection returns whole named fields; automatic overflow can return `textDocument.kind: "outline"`. Member page counts have `scope: "page"`; complete vote/group counts require `mode: "groups"`.
 - No domain environment variables, credentials, resources, prompts, persistent cache, or background tasks are required.
 
@@ -149,7 +150,9 @@ tests/
 
 ## Skills
 
-Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it. Keep `skills/` free for skills meant for those agents.
+Development skills live in `framework-skills/`; read them when a task matches, or run `bun run list-skills` for the registry. Framework-managed skills carry `metadata.audience: external` and are synced by maintenance. Server-owned development skills omit that marker.
+
+Root `skills/` is a separate, opt-in tree for agents that install the server, authored with `add-skill`. Maintenance never creates or modifies it. A published tree ships through npm, plugins, and MCPB; Docker delivery and `createApp({ skills: 'skills' })` require explicit adoption. This server does not publish skills.
 
 **Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
@@ -163,6 +166,7 @@ Available skills:
 | `add-app-tool` | Scaffold an MCP App tool + paired UI resource |
 | `add-resource` | Scaffold a new resource definition |
 | `add-prompt` | Scaffold a new prompt definition |
+| `add-skill` | Author a skill the server publishes in root `skills/` for agents that use it |
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
@@ -208,7 +212,7 @@ Available skills:
 | `bun run audit:fix` | `bun audit fix` — upgrade vulnerable packages to the lowest safe version within existing ranges (`--dry-run` previews, `--latest` rewrites ranges). First response when `devcheck` flags a transitive advisory; then `bun update <name>`, then `bun dedupe` |
 | `bun run audit:refresh` | Delete `bun.lock` and reinstall. Last resort after `audit:fix`, `bun update <name>`, and `bun dedupe` — re-resolves every ranged dep (the framework pin included) and rewrites the lockfile as `lockfileVersion: 2` |
 | `bun run lint:mcp` | Run the MCP definition linter standalone (rule catalog: `api-linter` skill) |
-| `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity (run by devcheck) |
+| `bun run lint:packaging` | Packaging checks — registry/bundle env parity, MCPB exclusions, plugin manifests, and published skills (run by devcheck) |
 | `bun run list-skills` | Print the skill registry |
 | `bun run tree` | Generate directory structure doc |
 | `bun run format` | Auto-fix formatting (safe fixes only) |
@@ -230,7 +234,7 @@ Available skills:
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. MCPB uses Node and stdio; Streamable HTTP runs separately. This keyless server needs no bundle user configuration.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. Every excluded root path needs a root-anchored `.mcpbignore` line; root `skills/` is never excluded. After packing, `scripts/clean-mcpb.ts` prunes dev dependencies, dependency-shipped agent docs, platform-specific native bindings, node-gyp generator/intermediate files that expose packing-machine paths (compiled `*.node` addons stay), and build-only framework and better-sqlite3 files. `lint:packaging` checks the exclusions and packed content. MCPB uses Node and stdio; Streamable HTTP runs separately. This keyless server needs no bundle user configuration.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 
@@ -298,6 +302,9 @@ import { withWorkflow } from '@/services/parliament/workflow.js';
 - [ ] If wrapping external API: tests include at least one sparse payload case with omitted upstream fields
 - [ ] Registered directly in the `createApp()` arrays in `src/index.ts`
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
+- [ ] Root `plugin.json` and `mcp.json` match package identity and the fixed environment in `.codex-plugin/mcp.json`; the Codex manifest retains its overlay pointer
+- [ ] MCPB exclusions are root-anchored; `bun run bundle` and `lint:packaging` pass
+- [ ] If publishing root `skills/`: validate the tree and field-test every gate and identifier claim
 - [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = the unscoped repo name (never the npm scope — `lint:packaging` enforces this); `interface.shortDescription` from `package.json` description
 - [ ] `.codex-plugin/mcp.json` updated — server name key is the unscoped repo name; every user-supplied variable (API key, contact email, instance URL) is listed in `env_vars` so Codex forwards it from the user's environment. Never write `"KEY": ""` into `env` — an empty value replaces the user's exported key and is read as unset
 - [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `author`, `repository`, `license`, `keywords` from `package.json`; inline `mcpServers` entry keyed by the unscoped repo name. Every user-supplied variable is declared under `userConfig` (`type`, `title`, `description`; `sensitive: true` for keys and tokens; `required: true` or `default: ""`) and referenced from `env` as `"KEY": "${user_config.<option>}"` — mirror the `user_config` block in `manifest.json`. Never write `"KEY": ""` into `env`

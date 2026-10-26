@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { BusinessIdentifierSchema } from '@/services/parliament/business-model.js';
 import { MemberCouncilInputSchema } from '@/services/parliament/member-model.js';
 import {
@@ -23,10 +23,13 @@ import { getTranscript, searchTranscripts } from '@/services/parliament/transcri
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import {
   COLLECTION_RESULT_LIMIT_BYTES,
+  clampNotice,
   completeResultBytes,
+  fieldTrailer,
   fitCollectionPage,
   formatParliamentResult,
-  renderField,
+  isPastEnd,
+  joinNotices,
 } from '../parliament-format.js';
 
 const OutputSchema = z.object({
@@ -152,15 +155,7 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
   }),
   output: OutputSchema,
   enrichment: EnrichmentSchema.shape,
-  enrichmentTrailer: {
-    effectiveFilters: { render: (value) => renderField('effectiveFilters', value) },
-    returnedCount: { render: (value) => renderField('returnedCount', value) },
-    effectiveLimit: { render: (value) => renderField('effectiveLimit', value) },
-    totalCount: { render: (value) => renderField('totalCount', value) },
-    nextOffset: { render: (value) => renderField('nextOffset', value) },
-    hasMore: { render: (value) => renderField('hasMore', value) },
-    notice: { render: (value) => renderField('notice', value) },
-  },
+  enrichmentTrailer: fieldTrailer(EnrichmentSchema.shape),
   errors: [
     {
       reason: 'search_scope_required',
@@ -187,9 +182,9 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
     {
       reason: 'incompatible_fields',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Business and subject are combined, or an exact passage ID is combined with search filters or paging.',
+      when: 'Business and subject are combined, an exact passage ID is combined with search filters or paging, or dateFrom is after dateTo.',
       recovery:
-        'For an exact passage, keep only transcriptId, language, and includeText; for searches, omit transcriptId and choose at most one of businessId and subjectId.',
+        'For an exact passage, keep only transcriptId, language, and includeText; for searches, omit transcriptId, choose at most one of businessId and subjectId, and use ascending date bounds.',
     },
     {
       reason: 'ambiguous_business_number',
@@ -228,7 +223,7 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
     )
       throw ctx.fail('incompatible_fields');
     if (input.dateFrom !== undefined && input.dateTo !== undefined && input.dateFrom > input.dateTo)
-      throw validationError('dateFrom must be on or before dateTo.', {
+      throw ctx.fail('incompatible_fields', 'dateFrom must be on or before dateTo.', {
         recovery: {
           hint: 'Use an ascending calendar-day range, then retry chparl_search_transcripts.',
         },
@@ -257,18 +252,16 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
 
     const exact = input.transcriptId !== undefined;
     const includeText = input.includeText ?? exact;
-    const maxLimit = includeText ? 10 : 100;
     const requestedLimit = input.limit ?? (includeText ? 3 : 20);
-    const paging = { limit: Math.min(requestedLimit, maxLimit), offset: input.offset ?? 0 };
+    const paging = {
+      limit: Math.min(requestedLimit, includeText ? 10 : 100),
+      offset: input.offset ?? 0,
+    };
     const filters = TranscriptFiltersSchema.parse({
       ...input,
       includeText,
       ...(exact ? {} : paging),
     });
-    const clampNotice =
-      requestedLimit > maxLimit
-        ? `Requested limit ${requestedLimit} was clamped to ${maxLimit}.`
-        : undefined;
 
     return withWorkflow(ctx, async (workflow): Promise<Output> => {
       if (input.transcriptId !== undefined) {
@@ -296,34 +289,21 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
 
       const result = await searchTranscripts(filters, paging, workflow);
       const prepared = fitCollectionPage(result.items, (transcripts, cut, oversized) => {
-        const notices: string[] = clampNotice === undefined ? [] : [clampNotice];
-        if (cut)
-          notices.push(
-            'Response byte fitting returned fewer whole passages. Continue with nextOffset; no original fields were shortened.',
-          );
-        if (transcripts.length === 0 && result.scopeFound !== false) {
-          if (result.noSubjects)
-            notices.push(
-              'This business has no published debate subjects. Use another chparl_get_business section or chparl_search_transcripts with a session or speaker filter.',
-            );
-          else if (
-            result.totalCount !== undefined &&
-            result.totalCount > 0 &&
-            paging.offset >= result.totalCount
-          )
-            notices.push(
-              'The requested offset is past the last matching passage. Retry chparl_search_transcripts with the same filters and offset:0.',
-            );
-          else
-            notices.push(
-              'No Bulletin passages matched these filters. Use chparl_get_business with section subjects, or chparl_list_reference with topic sessions, then retry chparl_search_transcripts.',
-            );
-        }
-        if (oversized)
-          notices.push(
-            `One indivisible passage or its provenance exceeds 24000 bytes and is returned whole. Retrieve this page with chparl_search_transcripts arguments ${JSON.stringify({ ...filters, offset: paging.offset, limit: 1 })}.`,
-          );
         const hasMore = transcripts.length > 0 && (cut || result.hasMore);
+        const notice = joinNotices(
+          clampNotice(requestedLimit, paging.limit),
+          cut &&
+            'Response byte fitting returned fewer whole passages. Continue with nextOffset; no original fields were shortened.',
+          transcripts.length === 0 &&
+            result.scopeFound !== false &&
+            (result.noSubjects
+              ? 'This business has no published debate subjects. Use another chparl_get_business section or chparl_search_transcripts with a session or speaker filter.'
+              : isPastEnd(result.totalCount, paging.offset)
+                ? 'The requested offset is past the last matching passage. Retry chparl_search_transcripts with the same filters and offset:0.'
+                : 'No Bulletin passages matched these filters. Use chparl_get_business with section subjects, or chparl_list_reference with topic sessions, then retry chparl_search_transcripts.'),
+          oversized &&
+            `One indivisible passage or its provenance exceeds 24000 bytes and is returned whole. Retrieve this page with chparl_search_transcripts arguments ${JSON.stringify({ ...filters, offset: paging.offset, limit: 1 })}.`,
+        );
         return {
           output: {
             transcripts,
@@ -341,7 +321,7 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
             ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
             hasMore,
             ...(hasMore && { nextOffset: paging.offset + transcripts.length }),
-            ...(notices.length > 0 && { notice: notices.join(' ') }),
+            ...(notice !== undefined && { notice }),
           },
         };
       });

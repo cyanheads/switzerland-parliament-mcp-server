@@ -19,9 +19,50 @@ import {
 } from '@/services/parliament/normalization.js';
 import { ProvenanceSchema, provenance } from '@/services/parliament/provenance.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
-import { fitCollectionPage, formatParliamentResult, renderField } from '../parliament-format.js';
+import {
+  clampNotice,
+  fieldTrailer,
+  fitCollectionPage,
+  formatParliamentResult,
+  isPastEnd,
+  joinNotices,
+} from '../parliament-format.js';
 
 const service = new MemberService();
+
+const EnrichmentSchema = z.object({
+  effectiveFilters: MemberSearchFiltersSchema.describe(
+    'Normalized search filters and resolved defaults.',
+  ),
+  returnedCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .describe('Number of complete MemberCouncil records delivered.'),
+  effectiveLimit: z
+    .number()
+    .int()
+    .positive()
+    .max(100)
+    .describe('Effective requested page size after clamping.'),
+  totalCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe('Exact whole-query MemberCouncil record count when supplied upstream.'),
+  nextOffset: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe('Starting offset plus delivered records; absent when exhausted.'),
+  hasMore: z.boolean().describe('Whether further matching affiliation records remain.'),
+  notice: z
+    .string()
+    .optional()
+    .describe('Combined clamping, byte fitting, empty-result, or past-end guidance.'),
+});
 
 /** Find affiliation records with stable paging and unchanged source names and labels. */
 export const searchMembersTool = tool('chparl_search_members', {
@@ -73,48 +114,8 @@ export const searchMembersTool = tool('chparl_search_members', {
       .describe('Complete MemberCouncil affiliation records delivered on this page.'),
     provenance: ProvenanceSchema,
   }),
-  enrichment: {
-    effectiveFilters: MemberSearchFiltersSchema.describe(
-      'Normalized search filters and resolved defaults.',
-    ),
-    returnedCount: z
-      .number()
-      .int()
-      .nonnegative()
-      .describe('Number of complete MemberCouncil records delivered.'),
-    effectiveLimit: z
-      .number()
-      .int()
-      .positive()
-      .max(100)
-      .describe('Effective requested page size after clamping.'),
-    totalCount: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe('Exact whole-query MemberCouncil record count when supplied upstream.'),
-    nextOffset: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe('Starting offset plus delivered records; absent when exhausted.'),
-    hasMore: z.boolean().describe('Whether further matching affiliation records remain.'),
-    notice: z
-      .string()
-      .optional()
-      .describe('Combined clamping, byte fitting, empty-result, or past-end guidance.'),
-  },
-  enrichmentTrailer: {
-    effectiveFilters: { render: (value) => renderField('effectiveFilters', value) },
-    returnedCount: { render: (value) => renderField('returnedCount', value) },
-    effectiveLimit: { render: (value) => renderField('effectiveLimit', value) },
-    totalCount: { render: (value) => renderField('totalCount', value) },
-    nextOffset: { render: (value) => renderField('nextOffset', value) },
-    hasMore: { render: (value) => renderField('hasMore', value) },
-    notice: { render: (value) => renderField('notice', value) },
-  },
+  enrichment: EnrichmentSchema.shape,
+  enrichmentTrailer: fieldTrailer(EnrichmentSchema.shape),
   errors: [
     {
       reason: 'upstream_rate_limited',
@@ -134,25 +135,18 @@ export const searchMembersTool = tool('chparl_search_members', {
     return withWorkflow(ctx, async (workflow) => {
       const page = await service.searchMembers(filters, workflow);
       const prepared = fitCollectionPage(page.items, (members, cut, oversized) => {
-        const notices: string[] = [];
-        if (input.limit > 100) notices.push(`Requested limit ${input.limit} was clamped to 100.`);
-        if (cut)
-          notices.push(
-            'Response byte fitting returned fewer whole member records. Continue with nextOffset; no record fields were shortened.',
-          );
-        if (members.length === 0)
-          notices.push(
-            page.totalCount !== undefined &&
-              page.totalCount > 0 &&
-              filters.offset >= page.totalCount
-              ? 'The requested offset is past the last matching member record. Call chparl_search_members with the same filters and offset zero.'
-              : 'No member records matched these filters. Try chparl_search_members with membership all, or use chparl_list_reference with topic councils, cantons, parties, or groups.',
-          );
-        if (oversized)
-          notices.push(
-            `One indivisible member record or its provenance exceeds 24000 bytes. Retrieve it with chparl_search_members using effectiveFilters unchanged except offset=${filters.offset} and limit=1. The record is returned whole.`,
-          );
         const hasMore = cut || page.hasMore;
+        const notice = joinNotices(
+          clampNotice(input.limit, filters.limit),
+          cut &&
+            'Response byte fitting returned fewer whole member records. Continue with nextOffset; no record fields were shortened.',
+          members.length === 0 &&
+            (isPastEnd(page.totalCount, filters.offset)
+              ? 'The requested offset is past the last matching member record. Call chparl_search_members with the same filters and offset zero.'
+              : 'No member records matched these filters. Try chparl_search_members with membership all, or use chparl_list_reference with topic councils, cantons, parties, or groups.'),
+          oversized &&
+            `One indivisible member record or its provenance exceeds 24000 bytes. Retrieve it with chparl_search_members using effectiveFilters unchanged except offset=${filters.offset} and limit=1. The record is returned whole.`,
+        );
         return {
           output: { members, provenance: provenance(workflow.sources) },
           enrichment: {
@@ -162,7 +156,7 @@ export const searchMembersTool = tool('chparl_search_members', {
             ...(page.totalCount !== undefined && { totalCount: page.totalCount }),
             ...(hasMore && { nextOffset: filters.offset + members.length }),
             hasMore,
-            ...(notices.length > 0 && { notice: notices.join(' ') }),
+            ...(notice !== undefined && { notice }),
           },
         };
       });

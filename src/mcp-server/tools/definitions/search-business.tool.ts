@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createBusinessCursor } from '@/services/parliament/business-cursor.js';
 import {
   BusinessSearchFiltersSchema,
@@ -19,12 +19,46 @@ import {
 } from '@/services/parliament/normalization.js';
 import { ProvenanceSchema, provenance } from '@/services/parliament/provenance.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
-import { fitCollectionPage, formatParliamentResult, renderField } from '../parliament-format.js';
+import {
+  clampNotice,
+  fieldTrailer,
+  fitCollectionPage,
+  formatParliamentResult,
+  joinNotices,
+} from '../parliament-format.js';
+
+const EnrichmentSchema = z.object({
+  effectiveFilters: BusinessSearchFiltersSchema,
+  returnedCount: z.number().int().nonnegative().describe('Distinct businesses actually delivered.'),
+  effectiveLimit: z
+    .number()
+    .int()
+    .positive()
+    .max(100)
+    .describe('Effective business or role-candidate limit after clamping.'),
+  totalCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe(
+      'Original-filter business total, available only without author or committee filters.',
+    ),
+  nextCursor: z
+    .string()
+    .optional()
+    .describe('Continue after the smallest delivered business ID using identical filters.'),
+  hasMore: z.boolean().describe('Whether older matching businesses remain.'),
+  notice: z
+    .string()
+    .optional()
+    .describe('Combined clamp, short-page, size-fitting, or empty-result guidance.'),
+});
 
 /** Find business items while keeping committee role counts distinct from business counts. */
 export const searchBusinessTool = tool('chparl_search_business', {
   description:
-    'Search Swiss parliamentary business by title substring, published submitter label, type, current status, submission session, inclusive submission dates, or committee role. Use chparl_list_reference to resolve codes and chparl_get_business to read a returned businessId. Follow nextCursor with unchanged filters; newest canonical business IDs appear first. Committee searches page role candidates and may return short pages without a distinct business total. Metadata labels remain in de, fr, or it without translation fallback.',
+    'Search Swiss parliamentary business by title substring, published submitter label, type, current status, submission session, inclusive submission dates, or committee role. Use chparl_list_reference to resolve codes and chparl_get_business to read a returned businessId. Follow nextCursor with unchanged filters; newest canonical business IDs appear first. Author searches omit the business total. Committee searches page role candidates and may return short pages without a distinct business total. Metadata labels remain in de, fr, or it without translation fallback.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     language: LanguageSchema.describe('Metadata language: de (default), fr, or it.'),
@@ -71,45 +105,15 @@ export const searchBusinessTool = tool('chparl_search_business', {
       .describe('Distinct complete business summaries on this page.'),
     provenance: ProvenanceSchema,
   }),
-  enrichment: {
-    effectiveFilters: BusinessSearchFiltersSchema,
-    returnedCount: z
-      .number()
-      .int()
-      .nonnegative()
-      .describe('Distinct businesses actually delivered.'),
-    effectiveLimit: z
-      .number()
-      .int()
-      .positive()
-      .max(100)
-      .describe('Effective business or role-candidate limit after clamping.'),
-    totalCount: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe('Original-filter business total, available only without a committee filter.'),
-    nextCursor: z
-      .string()
-      .optional()
-      .describe('Continue after the smallest delivered business ID using identical filters.'),
-    hasMore: z.boolean().describe('Whether older matching businesses remain.'),
-    notice: z
-      .string()
-      .optional()
-      .describe('Combined clamp, short-page, size-fitting, or empty-result guidance.'),
-  },
-  enrichmentTrailer: {
-    effectiveFilters: { render: (value) => renderField('effectiveFilters', value) },
-    returnedCount: { render: (value) => renderField('returnedCount', value) },
-    effectiveLimit: { render: (value) => renderField('effectiveLimit', value) },
-    totalCount: { render: (value) => renderField('totalCount', value) },
-    nextCursor: { render: (value) => renderField('nextCursor', value) },
-    hasMore: { render: (value) => renderField('hasMore', value) },
-    notice: { render: (value) => renderField('notice', value) },
-  },
+  enrichment: EnrichmentSchema.shape,
+  enrichmentTrailer: fieldTrailer(EnrichmentSchema.shape),
   errors: [
+    {
+      reason: 'incompatible_fields',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'submittedFrom is after submittedTo.',
+      recovery: 'Use an ascending submission-date range, then retry chparl_search_business.',
+    },
     {
       reason: 'invalid_cursor',
       code: JsonRpcErrorCode.ValidationError,
@@ -129,11 +133,7 @@ export const searchBusinessTool = tool('chparl_search_business', {
   ],
   handler(input, ctx) {
     if (input.submittedFrom && input.submittedTo && input.submittedFrom > input.submittedTo)
-      throw validationError('submittedFrom must be on or before submittedTo.', {
-        recovery: {
-          hint: 'Use an ascending submission-date range, then retry chparl_search_business.',
-        },
-      });
+      throw ctx.fail('incompatible_fields', 'submittedFrom must be on or before submittedTo.');
     const filters = BusinessSearchFiltersSchema.parse({
       ...input,
       limit: Math.min(input.limit, 100),
@@ -141,28 +141,21 @@ export const searchBusinessTool = tool('chparl_search_business', {
     return withWorkflow(ctx, async (workflow) => {
       const result = await searchBusiness(filters, workflow);
       const prepared = fitCollectionPage(result.items, (businesses, cut, oversized) => {
-        const notices: string[] = [];
-        if (input.limit > 100) notices.push(`Requested limit ${input.limit} was clamped to 100.`);
-        if (filters.committeeId)
-          notices.push(
-            'Committee pages examine at most the effective limit of role candidates and return each business once. Pages can be short; a distinct business total is unavailable.',
-          );
-        if (cut)
-          notices.push(
-            'Response byte fitting returned fewer whole businesses. Continue with nextCursor; no business fields were shortened.',
-          );
-        if (businesses.length === 0)
-          notices.push(
-            filters.cursor
-              ? 'No business remains after this cursor. Start chparl_search_business without cursor to repeat the search.'
-              : 'No parliamentary business matched these filters. Use chparl_list_reference with topic business_types, statuses, sessions, or committees to verify codes, or broaden chparl_search_business.',
-          );
-        if (oversized)
-          notices.push(
-            `One indivisible business or its provenance exceeds 24000 bytes and is returned whole. Retrieve this page with chparl_search_business arguments ${JSON.stringify({ ...filters, limit: 1 })}.`,
-          );
         const hasMore = businesses.length > 0 && (cut || result.hasMore);
         const last = businesses.at(-1);
+        const notice = joinNotices(
+          clampNotice(input.limit, filters.limit),
+          filters.committeeId !== undefined &&
+            'Committee pages examine at most the effective limit of role candidates and return each business once. Pages can be short; a distinct business total is unavailable.',
+          cut &&
+            'Response byte fitting returned fewer whole businesses. Continue with nextCursor; no business fields were shortened.',
+          businesses.length === 0 &&
+            (filters.cursor
+              ? 'No business remains after this cursor. Start chparl_search_business without cursor to repeat the search.'
+              : 'No parliamentary business matched these filters. Use chparl_list_reference with topic business_types, statuses, sessions, or committees to verify codes, or broaden chparl_search_business.'),
+          oversized &&
+            `One indivisible business or its provenance exceeds 24000 bytes and is returned whole. Retrieve this page with chparl_search_business arguments ${JSON.stringify({ ...filters, limit: 1 })}.`,
+        );
         return {
           output: { businesses, provenance: provenance(workflow.sources) },
           enrichment: {
@@ -172,7 +165,7 @@ export const searchBusinessTool = tool('chparl_search_business', {
             ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
             ...(hasMore && last && { nextCursor: createBusinessCursor(filters, last.businessId) }),
             hasMore,
-            ...(notices.length > 0 && { notice: notices.join(' ') }),
+            ...(notice !== undefined && { notice }),
           },
         };
       });

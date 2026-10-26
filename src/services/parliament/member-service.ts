@@ -6,20 +6,24 @@
 import { z } from '@cyanheads/mcp-ts-core';
 import { serializationError } from '@cyanheads/mcp-ts-core/errors';
 import type { MemberSearchFilters, MemberSummary } from './member-model.js';
-import { type Language, ODataDateSchema, odataInt32, odataString } from './normalization.js';
+import {
+  type Language,
+  odataInt32,
+  odataString,
+  RawDate,
+  RawId,
+  RawInt32,
+  RawLanguage,
+  RawText,
+} from './normalization.js';
 import {
   ODataClient,
   type ODataPage,
-  PARLIAMENT_ORIGIN,
+  odataEntityUrl,
   type ParliamentEntity,
 } from './odata-client.js';
 import { remainingWorkflowMs, type WorkflowContext } from './workflow.js';
 
-const RawId = z.number().int().positive().max(2_147_483_647);
-const RawCode = z.number().int().min(-2_147_483_648).max(2_147_483_647).nullish();
-const RawText = z.string().nullish();
-const RawDate = ODataDateSchema.nullish();
-const RawLanguage = z.enum(['DE', 'FR', 'IT']);
 const RawAffiliationSchema = z.object({
   Language: RawLanguage,
   PersonNumber: RawId,
@@ -71,7 +75,7 @@ const RawCommitteeSchema = z.object({
   Council: RawId.nullish(),
   CouncilName: RawText,
   CouncilAbbreviation: RawText,
-  CommitteeFunction: RawCode,
+  CommitteeFunction: RawInt32,
   CommitteeFunctionName: RawText,
 });
 const RawInterestSchema = z.object({
@@ -80,24 +84,20 @@ const RawInterestSchema = z.object({
   PersonNumber: RawId,
   InterestName: RawText,
   Agency: RawText,
-  InterestType: RawCode,
+  InterestType: RawInt32,
   InterestTypeText: RawText,
-  OrganizationType: RawCode,
+  OrganizationType: RawInt32,
   OrganizationTypeText: RawText,
-  FunctionInAgency: RawCode,
+  FunctionInAgency: RawInt32,
   FunctionInAgencyText: RawText,
   Paid: z.boolean().nullish(),
-  SortOrder: RawCode,
+  SortOrder: RawInt32,
   Modified: RawDate,
 });
 const affiliationSelect = Object.keys(RawAffiliationSchema.shape);
 
 function sourceUrl(entity: ParliamentEntity, id: number | string, language: Language): string {
-  const literal = typeof id === 'number' ? String(id) : `guid'${id}'`;
-  return new URL(
-    `/odata.svc/${entity}(ID=${literal},Language=${odataString(language.toUpperCase())})`,
-    PARLIAMENT_ORIGIN,
-  ).href;
+  return odataEntityUrl(entity, typeof id === 'number' ? String(id) : `guid'${id}'`, language);
 }
 
 function verifyLanguage(raw: { Language: string }, language: Language): void {

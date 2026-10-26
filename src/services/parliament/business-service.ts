@@ -18,8 +18,15 @@ import {
   type RawBusiness,
   RawBusinessSchema,
 } from './business-model.js';
-import { type BusinessRelationshipSection, listBusinessSection } from './business-relations.js';
-import { type Language, odataDay, odataInt32, odataString } from './normalization.js';
+import {
+  type Language,
+  odataDay,
+  odataInt32,
+  odataString,
+  RawId,
+  RawLanguage,
+  utf8ByteLength,
+} from './normalization.js';
 import { ODataClient, type ODataPage, type ODataQuery } from './odata-client.js';
 import type { WorkflowContext } from './workflow.js';
 
@@ -102,19 +109,21 @@ function businessPredicates(filters: BusinessSearchFilters, prefix = ''): string
   return clauses;
 }
 
-/** Business discovery returns an exact total only on the direct Business route. */
+/** Direct author discovery uses lookahead; other direct searches retain exact source totals. */
 export async function searchBusiness(
   filters: BusinessSearchFilters,
   workflow: WorkflowContext,
 ): Promise<ODataPage<BusinessSummary>> {
   const after = readBusinessCursor(filters);
   if (!filters.committeeId) {
+    const authorSearch = filters.author !== undefined;
     const predicates = businessPredicates(filters);
     const base: ODataQuery = {
       entity: 'Business',
       language: filters.language,
       select: BUSINESS_SUMMARY_FIELDS,
       orderBy: [{ field: 'ID', direction: 'desc' }],
+      ...(authorSearch && { includeCount: false }),
       ...(predicates.length > 0 && { filter: predicates.join(' and ') }),
     };
     const page = await client.collection(
@@ -125,9 +134,17 @@ export async function searchBusiness(
         }),
       },
       RawBusinessSchema,
-      { limit: filters.limit, offset: 0 },
+      { limit: filters.limit + (authorSearch ? 1 : 0), offset: 0 },
       workflow,
     );
+    if (authorSearch) {
+      return {
+        items: page.items
+          .slice(0, filters.limit)
+          .map((row) => normalizeBusiness(row, filters.language)),
+        hasMore: page.items.length > filters.limit,
+      };
+    }
     const total =
       after === undefined
         ? page.totalCount
@@ -150,11 +167,7 @@ export async function searchBusiness(
     `Businesses/Language eq ${odataString(filters.language.toUpperCase())}`,
     ...businessPredicates(filters, 'Businesses/'),
   ];
-  const roleSchema = z.object({
-    ID: z.guid(),
-    Language: z.enum(['DE', 'FR', 'IT']),
-    BusinessNumber: z.number().int().positive().max(2_147_483_647),
-  });
+  const roleSchema = z.object({ ID: z.guid(), Language: RawLanguage, BusinessNumber: RawId });
   const base: ODataQuery = {
     entity: 'BusinessRole',
     language: filters.language,
@@ -265,19 +278,8 @@ export function businessOverview(raw: RawBusiness, language: Language) {
       const value = raw[BUSINESS_TEXT_FIELDS[name]];
       return {
         name,
-        ...(value != null && { sizeBytes: new TextEncoder().encode(value).byteLength }),
+        ...(value != null && { sizeBytes: utf8ByteLength(value) }),
       };
     }),
   };
-}
-
-/** Read one independently paged procedural collection using the same shared client and deadline. */
-export function getBusinessSection(
-  businessId: string,
-  section: BusinessRelationshipSection,
-  language: Language,
-  paging: { limit: number; offset: number },
-  workflow: WorkflowContext,
-) {
-  return listBusinessSection(client, businessId, section, language, paging, workflow);
 }

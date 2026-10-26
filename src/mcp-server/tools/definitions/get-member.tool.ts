@@ -21,10 +21,13 @@ import { ProvenanceSchema, provenance } from '@/services/parliament/provenance.j
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import {
   COLLECTION_RESULT_LIMIT_BYTES,
+  clampNotice,
   completeResultBytes,
+  fieldTrailer,
   fitCollectionPage,
   formatParliamentResult,
-  renderField,
+  isPastEnd,
+  joinNotices,
 } from '../parliament-format.js';
 
 const service = new MemberService();
@@ -60,6 +63,50 @@ const MemberOutputSchema = z.object({
   provenance: ProvenanceSchema,
 });
 type MemberOutput = z.infer<typeof MemberOutputSchema>;
+
+const EnrichmentSchema = z.object({
+  effectiveFilters: MemberProfileFiltersSchema.describe(
+    'Normalized profile parameters and defaults for the selected section.',
+  ),
+  returnedCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe('Number of profile records returned; omitted for a missing person.'),
+  effectiveLimit: z
+    .number()
+    .int()
+    .positive()
+    .max(100)
+    .optional()
+    .describe('Effective page size, present only for relationship sections.'),
+  totalCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe(
+      'Exact section count when supplied upstream, or the fully enumerated overview membership count.',
+    ),
+  nextOffset: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe('Starting offset plus delivered records; absent when exhausted or unpaged.'),
+  hasMore: z
+    .boolean()
+    .optional()
+    .describe('Whether section records remain; false for complete overview affiliations.'),
+  notice: z
+    .string()
+    .optional()
+    .describe('Combined clamping, size, empty-section, or past-end guidance.'),
+});
+
+const EMPTY_SECTION_NOTICE =
+  'No records are published for this profile section. Use another chparl_get_member section or chparl_search_members with membership all.';
 
 /** Follow a PersonNumber through independent identity, term, committee, and interest workflows. */
 export const getMemberTool = tool('chparl_get_member', {
@@ -98,55 +145,8 @@ export const getMemberTool = tool('chparl_get_member', {
       ),
   }),
   output: MemberOutputSchema,
-  enrichment: {
-    effectiveFilters: MemberProfileFiltersSchema.describe(
-      'Normalized profile parameters and defaults for the selected section.',
-    ),
-    returnedCount: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe('Number of profile records returned; omitted for a missing person.'),
-    effectiveLimit: z
-      .number()
-      .int()
-      .positive()
-      .max(100)
-      .optional()
-      .describe('Effective page size, present only for relationship sections.'),
-    totalCount: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe(
-        'Exact section count when supplied upstream, or the fully enumerated overview membership count.',
-      ),
-    nextOffset: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe('Starting offset plus delivered records; absent when exhausted or unpaged.'),
-    hasMore: z
-      .boolean()
-      .optional()
-      .describe('Whether section records remain; false for complete overview affiliations.'),
-    notice: z
-      .string()
-      .optional()
-      .describe('Combined clamping, size, empty-section, or past-end guidance.'),
-  },
-  enrichmentTrailer: {
-    effectiveFilters: { render: (value) => renderField('effectiveFilters', value) },
-    returnedCount: { render: (value) => renderField('returnedCount', value) },
-    effectiveLimit: { render: (value) => renderField('effectiveLimit', value) },
-    totalCount: { render: (value) => renderField('totalCount', value) },
-    nextOffset: { render: (value) => renderField('nextOffset', value) },
-    hasMore: { render: (value) => renderField('hasMore', value) },
-    notice: { render: (value) => renderField('notice', value) },
-  },
+  enrichment: EnrichmentSchema.shape,
+  enrichmentTrailer: fieldTrailer(EnrichmentSchema.shape),
   errors: [
     {
       reason: 'incompatible_fields',
@@ -168,14 +168,13 @@ export const getMemberTool = tool('chparl_get_member', {
   handler(input, ctx) {
     if (input.section === 'overview' && (input.limit !== undefined || input.offset !== undefined))
       throw ctx.fail('incompatible_fields');
+    const requestedLimit = input.limit ?? 20;
+    const paging = { limit: Math.min(requestedLimit, 100), offset: input.offset ?? 0 };
     const filters = MemberProfileFiltersSchema.parse({
       personNumber: input.personNumber,
       language: input.language,
       section: input.section,
-      ...(input.section !== 'overview' && {
-        limit: Math.min(input.limit ?? 20, 100),
-        offset: input.offset ?? 0,
-      }),
+      ...(input.section !== 'overview' && paging),
     });
     return withWorkflow(ctx, async (workflow) => {
       const person = await service.getPerson(filters.personNumber, filters.language, workflow);
@@ -202,52 +201,38 @@ export const getMemberTool = tool('chparl_get_member', {
           memberships,
           provenance: provenance(workflow.sources),
         };
-        const notices: string[] = [];
-        if (memberships.length === 0)
-          notices.push(
-            'No records are published for this profile section. Use another chparl_get_member section or chparl_search_members with membership all.',
-          );
+        const empty = memberships.length === 0 && EMPTY_SECTION_NOTICE;
         const enrichment = {
           effectiveFilters: filters,
           returnedCount: memberships.length,
           totalCount: memberships.length,
           hasMore: false,
         };
-        if (
-          completeResultBytes(output, {
-            ...enrichment,
-            ...(notices.length > 0 && { notice: notices.join(' ') }),
-          }) >= COLLECTION_RESULT_LIMIT_BYTES
-        )
-          notices.push(
+        const oversized =
+          completeResultBytes(output, { ...enrichment, ...(empty && { notice: empty }) }) >=
+          COLLECTION_RESULT_LIMIT_BYTES;
+        const notice = joinNotices(
+          empty,
+          oversized &&
             'This complete unpaged overview exceeds 24000 bytes. All base affiliations are returned whole; use chparl_get_member section council_terms for independently paged historical terms.',
-          );
-        ctx.enrich({ ...enrichment, ...(notices.length > 0 && { notice: notices.join(' ') }) });
+        );
+        ctx.enrich({ ...enrichment, ...(notice !== undefined && { notice }) });
         return output;
       }
-      const paging = { limit: Math.min(input.limit ?? 20, 100), offset: input.offset ?? 0 };
       const finish = <T>(page: ODataPage<T>, build: (items: T[]) => MemberOutput): MemberOutput => {
         const prepared = fitCollectionPage(page.items, (items, cut, oversized) => {
-          const notices: string[] = [];
-          if ((input.limit ?? 20) > 100)
-            notices.push(`Requested limit ${input.limit} was clamped to 100.`);
-          if (cut)
-            notices.push(
-              'Response byte fitting returned fewer whole profile records. Continue with nextOffset; no record fields were shortened.',
-            );
-          if (items.length === 0)
-            notices.push(
-              page.totalCount !== undefined &&
-                page.totalCount > 0 &&
-                paging.offset >= page.totalCount
-                ? `The requested offset is past this profile section. Call chparl_get_member with personNumber=${filters.personNumber}, section=${filters.section}, language=${filters.language}, and offset=0.`
-                : 'No records are published for this profile section. Use another chparl_get_member section or chparl_search_members with membership all.',
-            );
-          if (oversized)
-            notices.push(
-              `One indivisible profile record or its provenance exceeds 24000 bytes. Retrieve it with chparl_get_member personNumber=${filters.personNumber}, section=${filters.section}, language=${filters.language}, offset=${paging.offset}, limit=1. The record is returned whole.`,
-            );
           const hasMore = cut || page.hasMore;
+          const notice = joinNotices(
+            clampNotice(requestedLimit, paging.limit),
+            cut &&
+              'Response byte fitting returned fewer whole profile records. Continue with nextOffset; no record fields were shortened.',
+            items.length === 0 &&
+              (isPastEnd(page.totalCount, paging.offset)
+                ? `The requested offset is past this profile section. Call chparl_get_member with personNumber=${filters.personNumber}, section=${filters.section}, language=${filters.language}, and offset=0.`
+                : EMPTY_SECTION_NOTICE),
+            oversized &&
+              `One indivisible profile record or its provenance exceeds 24000 bytes. Retrieve it with chparl_get_member personNumber=${filters.personNumber}, section=${filters.section}, language=${filters.language}, offset=${paging.offset}, limit=1. The record is returned whole.`,
+          );
           return {
             output: build(items),
             enrichment: {
@@ -257,7 +242,7 @@ export const getMemberTool = tool('chparl_get_member', {
               ...(page.totalCount !== undefined && { totalCount: page.totalCount }),
               ...(hasMore && { nextOffset: paging.offset + items.length }),
               hasMore,
-              ...(notices.length > 0 && { notice: notices.join(' ') }),
+              ...(notice !== undefined && { notice }),
             },
           };
         });

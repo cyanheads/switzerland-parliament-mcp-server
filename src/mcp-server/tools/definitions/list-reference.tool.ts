@@ -18,7 +18,46 @@ import {
   ReferenceTopicSchema,
 } from '@/services/parliament/reference-model.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
-import { fitCollectionPage, formatParliamentResult, renderField } from '../parliament-format.js';
+import {
+  clampNotice,
+  fieldTrailer,
+  fitCollectionPage,
+  formatParliamentResult,
+  isPastEnd,
+  joinNotices,
+} from '../parliament-format.js';
+
+const EnrichmentSchema = z.object({
+  effectiveFilters: ReferenceFiltersSchema,
+  returnedCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .describe('Number of complete entries actually delivered.'),
+  effectiveLimit: z
+    .number()
+    .int()
+    .positive()
+    .max(100)
+    .describe('Effective row limit after clamping; response-size fitting may deliver fewer.'),
+  totalCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe('Whole-query reference count when the source supplies one.'),
+  nextOffset: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe('Original offset plus delivered entries; absent when exhausted.'),
+  hasMore: z.boolean().describe('Whether entries remain beyond this delivered page.'),
+  notice: z
+    .string()
+    .optional()
+    .describe('Combined limit, whole-item byte-budget, empty-result, or past-end guidance.'),
+});
 
 /** Resolve reference keys and documented coverage without accepting caller-authored OData. */
 export const listReferenceTool = tool('chparl_list_reference', {
@@ -58,46 +97,8 @@ export const listReferenceTool = tool('chparl_list_reference', {
       .describe('Complete reference entries delivered on this page.'),
     provenance: ProvenanceSchema,
   }),
-  enrichment: {
-    effectiveFilters: ReferenceFiltersSchema,
-    returnedCount: z
-      .number()
-      .int()
-      .nonnegative()
-      .describe('Number of complete entries actually delivered.'),
-    effectiveLimit: z
-      .number()
-      .int()
-      .positive()
-      .max(100)
-      .describe('Effective row limit after clamping; response-size fitting may deliver fewer.'),
-    totalCount: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe('Whole-query reference count when the source supplies one.'),
-    nextOffset: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe('Original offset plus delivered entries; absent when exhausted.'),
-    hasMore: z.boolean().describe('Whether entries remain beyond this delivered page.'),
-    notice: z
-      .string()
-      .optional()
-      .describe('Combined limit, whole-item byte-budget, empty-result, or past-end guidance.'),
-  },
-  enrichmentTrailer: {
-    effectiveFilters: { render: (value) => renderField('effectiveFilters', value) },
-    returnedCount: { render: (value) => renderField('returnedCount', value) },
-    effectiveLimit: { render: (value) => renderField('effectiveLimit', value) },
-    totalCount: { render: (value) => renderField('totalCount', value) },
-    nextOffset: { render: (value) => renderField('nextOffset', value) },
-    hasMore: { render: (value) => renderField('hasMore', value) },
-    notice: { render: (value) => renderField('notice', value) },
-  },
+  enrichment: EnrichmentSchema.shape,
+  enrichmentTrailer: fieldTrailer(EnrichmentSchema.shape),
   errors: [
     {
       reason: 'incompatible_fields',
@@ -140,29 +141,16 @@ export const listReferenceTool = tool('chparl_list_reference', {
     return withWorkflow(ctx, async (workflow) => {
       const result = await getParliamentService().listReference(filters, workflow);
       const prepared = fitCollectionPage(result.items, (items, cut, oversized) => {
-        const notices: string[] = [];
-        if (input.limit > 100) notices.push(`Requested limit ${input.limit} was clamped to 100.`);
-        if (cut)
-          notices.push(
-            'Response byte fitting returned fewer whole entries. Continue with nextOffset; no entry fields were shortened.',
-          );
-        if (items.length === 0) {
-          if (
-            result.totalCount !== undefined &&
-            result.totalCount > 0 &&
-            filters.offset >= result.totalCount
-          )
-            notices.push('The requested offset is past the last matching reference entry.');
-          else notices.push('No reference entries matched the query.');
-          notices.push(
-            'No reference entries occur on this page. Call chparl_list_reference for this topic with offset zero, or revise the session dates.',
-          );
-        }
-        if (oversized)
-          notices.push(
-            `One indivisible reference entry or its provenance exceeds 24000 bytes. Retrieve this exact page with chparl_list_reference topic=${filters.topic}, language=${filters.language}, offset=${filters.offset}, limit=1${filters.dateFrom ? `, dateFrom=${filters.dateFrom}` : ''}${filters.dateTo ? `, dateTo=${filters.dateTo}` : ''}. The entry is returned whole.`,
-          );
         const hasMore = cut || result.hasMore;
+        const notice = joinNotices(
+          clampNotice(input.limit, filters.limit),
+          cut &&
+            'Response byte fitting returned fewer whole entries. Continue with nextOffset; no entry fields were shortened.',
+          items.length === 0 &&
+            `${isPastEnd(result.totalCount, filters.offset) ? 'The requested offset is past the last matching reference entry.' : 'No reference entries matched the query.'} No reference entries occur on this page. Call chparl_list_reference for this topic with offset zero, or revise the session dates.`,
+          oversized &&
+            `One indivisible reference entry or its provenance exceeds 24000 bytes. Retrieve this exact page with chparl_list_reference topic=${filters.topic}, language=${filters.language}, offset=${filters.offset}, limit=1${filters.dateFrom ? `, dateFrom=${filters.dateFrom}` : ''}${filters.dateTo ? `, dateTo=${filters.dateTo}` : ''}. The entry is returned whole.`,
+        );
         return {
           output: { topic: input.topic, items, provenance: provenance(workflow.sources) },
           enrichment: {
@@ -172,7 +160,7 @@ export const listReferenceTool = tool('chparl_list_reference', {
             ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
             ...(hasMore && { nextOffset: filters.offset + items.length }),
             hasMore,
-            ...(notices.length > 0 && { notice: notices.join(' ') }),
+            ...(notice !== undefined && { notice }),
           },
         };
       });

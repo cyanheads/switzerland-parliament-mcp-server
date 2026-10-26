@@ -9,15 +9,16 @@ import { BusinessTextReferenceSchema, businessTextReferences } from './business-
 import {
   Int64IdSchema,
   type Language,
+  MetadataLanguageSchema,
   normalizeMeetingDate,
-  ODataDateSchema,
   odataInt64,
-  odataString,
+  RawDate,
+  RawInt32,
+  RawLanguage,
+  RawText,
+  utf8ByteLength,
 } from './normalization.js';
-import { PARLIAMENT_ORIGIN } from './odata-client.js';
-
-const RawInt32 = z.number().int().min(-2_147_483_648).max(2_147_483_647).nullish();
-const RawText = z.string().nullish();
+import { odataEntityUrl } from './odata-client.js';
 
 /** Text remains selected in metadata mode so its actual UTF-8 size can be measured. */
 export const TRANSCRIPT_FIELDS = [
@@ -50,7 +51,7 @@ export const TRANSCRIPT_FIELDS = [
 /** The source's Int64 values remain strings; nullable metadata never becomes a fabricated value. */
 export const RawTranscriptSchema = z.object({
   ID: Int64IdSchema,
-  Language: z.enum(['DE', 'FR', 'IT']),
+  Language: RawLanguage,
   IdSubject: Int64IdSchema.nullish(),
   PersonNumber: RawInt32,
   SpeakerFirstName: RawText,
@@ -64,10 +65,10 @@ export const RawTranscriptSchema = z.object({
   MeetingDate: z.string().transform(normalizeMeetingDate).nullish(),
   IdSession: RawText,
   SortOrder: RawInt32,
-  Start: ODataDateSchema.nullish(),
-  End: ODataDateSchema.nullish(),
-  StartTimeWithTimezone: ODataDateSchema.nullish(),
-  EndTimeWithTimezone: ODataDateSchema.nullish(),
+  Start: RawDate,
+  End: RawDate,
+  StartTimeWithTimezone: RawDate,
+  EndTimeWithTimezone: RawDate,
   LanguageOfText: RawText,
   VoteId: RawText,
   VoteBusinessNumber: RawInt32,
@@ -82,9 +83,9 @@ export type RawTranscript = z.infer<typeof RawTranscriptSchema>;
 export const TranscriptSchema = z
   .object({
     transcriptId: z.string().describe('Transcript.ID as an exact signed Int64 decimal string.'),
-    metadataLanguage: z
-      .enum(['de', 'fr', 'it'])
-      .describe('Selected metadata row language; original text is never translated.'),
+    metadataLanguage: MetadataLanguageSchema.describe(
+      'Selected metadata row language; original text is never translated.',
+    ),
     sourceUrl: z.string().describe('Exact HTTPS OData composite-key passage URL.'),
     subjectId: z
       .string()
@@ -175,7 +176,7 @@ export function normalizeTranscript(
   return {
     transcriptId: raw.ID,
     metadataLanguage: language,
-    sourceUrl: `${PARLIAMENT_ORIGIN}/odata.svc/Transcript(ID=${odataInt64(raw.ID)},Language=${odataString(language.toUpperCase())})?$format=json`,
+    sourceUrl: `${odataEntityUrl('Transcript', odataInt64(raw.ID), language)}?$format=json`,
     ...(raw.IdSubject != null && { subjectId: raw.IdSubject }),
     ...(raw.PersonNumber != null && { personNumber: String(raw.PersonNumber) }),
     ...(raw.SpeakerFirstName != null && { speakerFirstName: raw.SpeakerFirstName }),
@@ -198,7 +199,7 @@ export function normalizeTranscript(
       businessShortNumber: raw.VoteBusinessShortNumber,
     }),
     ...(raw.Text != null && {
-      textSizeBytes: new TextEncoder().encode(raw.Text).byteLength,
+      textSizeBytes: utf8ByteLength(raw.Text),
       ...(includeText && { text: raw.Text, references: businessTextReferences(raw.Text) }),
     }),
   };
@@ -207,7 +208,7 @@ export function normalizeTranscript(
 /** Normalized filters echoed identically for exact lookup and scoped searches. */
 export const TranscriptFiltersSchema = z
   .object({
-    language: z.enum(['de', 'fr', 'it']).describe('Selected metadata language.'),
+    language: MetadataLanguageSchema.describe('Selected metadata language.'),
     businessId: z
       .string()
       .optional()

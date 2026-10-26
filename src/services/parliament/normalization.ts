@@ -6,10 +6,13 @@
 import { z } from '@cyanheads/mcp-ts-core';
 import { serializationError } from '@cyanheads/mcp-ts-core/errors';
 
+/** A supported metadata language as echoed in results and filters. */
+export const MetadataLanguageSchema = z.enum(['de', 'fr', 'it']);
+
 /** Metadata language; input casing is normalized without selecting a fallback language. */
 export const LanguageSchema = z.preprocess(
   (value) => (typeof value === 'string' ? value.trim().toLowerCase() || undefined : value),
-  z.enum(['de', 'fr', 'it']).default('de'),
+  MetadataLanguageSchema.default('de'),
 );
 
 /** Supported metadata language, distinct from the language of published debate text. */
@@ -90,8 +93,27 @@ export function normalizeODataDate(value: string): string {
   return `${date.toISOString().replace(/Z$/, '')}${offset[0]}${hours}:${minutes}`;
 }
 
-/** OData DateTime schema normalizes at the network edge, without an invented timezone. */
-export const ODataDateSchema = z.string().transform(normalizeODataDate);
+/** Upstream metadata-row language code on every source record. */
+export const RawLanguage = z.enum(['DE', 'FR', 'IT']);
+
+/** Required positive Int32 source key. */
+export const RawId = z.number().int().positive().max(2_147_483_647);
+
+/** Nullable or absent signed Int32 source value. */
+export const RawInt32 = z.number().int().min(-2_147_483_648).max(2_147_483_647).nullish();
+
+/** Nullable or absent source string, kept unchanged. */
+export const RawText = z.string().nullish();
+
+/** Nullable or absent OData DateTime, normalized once at the network edge without an invented timezone. */
+export const RawDate = z.string().transform(normalizeODataDate).nullish();
+
+const encoder = new TextEncoder();
+
+/** Actual UTF-8 byte length of an original source string. */
+export function utf8ByteLength(value: string): number {
+  return encoder.encode(value).byteLength;
+}
 
 /** Parse the upstream decimal count only when it can be represented exactly. */
 export const ODataCountSchema = z

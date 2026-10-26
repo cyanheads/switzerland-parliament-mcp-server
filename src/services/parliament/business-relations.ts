@@ -9,56 +9,53 @@ import type { BusinessSectionSchema } from './business-model.js';
 import {
   Int64IdSchema,
   type Language,
-  ODataDateSchema,
   odataInt32,
-  odataString,
+  RawDate,
+  RawId,
+  RawInt32,
+  RawLanguage,
+  RawText,
 } from './normalization.js';
-import {
-  type ODataClient,
-  type ODataPage,
-  type ODataQuery,
-  PARLIAMENT_ORIGIN,
-} from './odata-client.js';
+import { ODataClient, type ODataPage, type ODataQuery, odataEntityUrl } from './odata-client.js';
 import type { WorkflowContext } from './workflow.js';
 
-const Text = z.string().nullish();
-const Integer = z.number().int().min(-2_147_483_648).max(2_147_483_647).nullish();
-const DateValue = ODataDateSchema.nullish();
+const client = new ODataClient();
+
 const RawSectionSchema = z.object({
   ID: z.guid().optional(),
-  Language: z.enum(['DE', 'FR', 'IT']),
-  BusinessNumber: Integer,
-  BusinessStatusId: Integer,
-  BusinessStatusName: Text,
-  BusinessStatusDate: DateValue,
+  Language: RawLanguage,
+  BusinessNumber: RawInt32,
+  BusinessStatusId: RawInt32,
+  BusinessStatusName: RawText,
+  BusinessStatusDate: RawDate,
   IsMotionInSecondCouncil: z.boolean().nullish(),
-  NewKey: Integer,
-  Modified: DateValue,
-  BillNumber: Integer,
-  BillType: Integer,
-  BillTypeName: Text,
-  Title: Text,
-  BusinessStatus: Integer,
-  BusinessStatusText: Text,
-  SubmissionDate: DateValue,
-  RelatedBusinessNumber: Integer,
-  RelatedBusinessShortNumber: Text,
-  RelatedBusinessTitle: Text,
-  RelatedBusinessType: Integer,
-  RelatedBusinessTypeName: Text,
-  RelatedBusinessTypeAbbreviation: Text,
-  PriorityCode: Text,
+  NewKey: RawInt32,
+  Modified: RawDate,
+  BillNumber: RawInt32,
+  BillType: RawInt32,
+  BillTypeName: RawText,
+  Title: RawText,
+  BusinessStatus: RawInt32,
+  BusinessStatusText: RawText,
+  SubmissionDate: RawDate,
+  RelatedBusinessNumber: RawInt32,
+  RelatedBusinessShortNumber: RawText,
+  RelatedBusinessTitle: RawText,
+  RelatedBusinessType: RawInt32,
+  RelatedBusinessTypeName: RawText,
+  RelatedBusinessTypeAbbreviation: RawText,
+  PriorityCode: RawText,
   IdBill: z.guid().nullish(),
-  CommitteeNumber: Integer,
-  CommitteeName: Text,
-  Abbreviation: Text,
-  Abbreviation1: Text,
-  Abbreviation2: Text,
-  PreconsultationDate: DateValue,
-  TreatmentCategory: Text,
+  CommitteeNumber: RawInt32,
+  CommitteeName: RawText,
+  Abbreviation: RawText,
+  Abbreviation1: RawText,
+  Abbreviation2: RawText,
+  PreconsultationDate: RawDate,
+  TreatmentCategory: RawText,
   IdSubject: Int64IdSchema.optional(),
-  SortOrder: Integer,
-  PublishedNotes: Text,
+  SortOrder: RawInt32,
+  PublishedNotes: RawText,
 });
 
 /** Complete selected procedural fields; absent source values remain unknown. */
@@ -206,7 +203,6 @@ const definitions: Record<BusinessRelationshipSection, Definition> = {
 
 /** Page the chosen section directly; deferred or partial navigation collections are never used. */
 export async function listBusinessSection(
-  client: ODataClient,
   businessId: string,
   section: BusinessRelationshipSection,
   language: Language,
@@ -216,10 +212,7 @@ export async function listBusinessSection(
   const definition = definitions[section];
   const schema: z.ZodType<z.infer<typeof RawSectionSchema>> =
     section === 'subjects'
-      ? RawSectionSchema.extend({
-          IdSubject: Int64IdSchema,
-          BusinessNumber: z.number().int().positive().max(2_147_483_647),
-        })
+      ? RawSectionSchema.extend({ IdSubject: Int64IdSchema, BusinessNumber: RawId })
       : RawSectionSchema.extend({ ID: z.guid() });
   const page = await client.collection(
     {
@@ -263,7 +256,7 @@ export async function listBusinessSection(
         ...(raw.SubmissionDate != null && { submissionDate: raw.SubmissionDate }),
         ...(section === 'bills' &&
           raw.ID !== undefined && {
-            sourceUrl: `${PARLIAMENT_ORIGIN}/odata.svc/Bill(ID=guid'${raw.ID}',Language=${odataString(language.toUpperCase())})?$format=json`,
+            sourceUrl: `${odataEntityUrl('Bill', `guid'${raw.ID}'`, language)}?$format=json`,
           }),
         ...(raw.RelatedBusinessNumber != null && {
           relatedBusinessId: String(raw.RelatedBusinessNumber),

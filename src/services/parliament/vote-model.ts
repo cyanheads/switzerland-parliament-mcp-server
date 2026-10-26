@@ -5,12 +5,17 @@
 
 import { z } from '@cyanheads/mcp-ts-core';
 import { serializationError } from '@cyanheads/mcp-ts-core/errors';
-import { type Language, ODataDateSchema, odataString } from './normalization.js';
-import { PARLIAMENT_ORIGIN } from './odata-client.js';
-
-const RawInt32 = z.number().int().min(-2_147_483_648).max(2_147_483_647);
-const RawId = RawInt32.positive();
-const RawText = z.string().nullish();
+import { canonicalCantonId } from './canton-mapping.js';
+import {
+  type Language,
+  MetadataLanguageSchema,
+  RawDate,
+  RawId,
+  RawInt32,
+  RawLanguage,
+  RawText,
+} from './normalization.js';
+import { odataEntityUrl } from './odata-client.js';
 
 /** Vote metadata projection deliberately excludes all member decisions. */
 export const VOTE_FIELDS = [
@@ -49,24 +54,35 @@ export const VOTING_FIELDS = [
   'DecisionText',
 ] as const;
 
+/** History rows need source context because no single selected-vote header accompanies them. */
+export const HISTORY_VOTING_FIELDS = [
+  ...VOTING_FIELDS,
+  'BusinessNumber',
+  'BusinessShortNumber',
+  'BusinessTitle',
+  'IdSession',
+  'VoteEnd',
+  'VoteEndWithTimezone',
+] as const;
+
 /** Validate selected vote fields once at the HTTP edge. */
 export const RawVoteSchema = z.object({
   ID: RawId,
-  Language: z.enum(['DE', 'FR', 'IT']),
-  BusinessNumber: RawInt32.nullish(),
+  Language: RawLanguage,
+  BusinessNumber: RawInt32,
   BusinessShortNumber: RawText,
   BusinessTitle: RawText,
-  BillNumber: RawInt32.nullish(),
+  BillNumber: RawInt32,
   BillTitle: RawText,
-  RegistrationNumber: RawInt32.nullish(),
+  RegistrationNumber: RawInt32,
   IdLegislativePeriod: z.number().int().min(-32_768).max(32_767).nullish(),
-  IdSession: RawInt32.nullish(),
+  IdSession: RawInt32,
   SessionName: RawText,
   Subject: RawText,
   MeaningYes: RawText,
   MeaningNo: RawText,
-  VoteEnd: ODataDateSchema.nullish(),
-  VoteEndWithTimezone: ODataDateSchema.nullish(),
+  VoteEnd: RawDate,
+  VoteEndWithTimezone: RawDate,
 });
 
 /** Validated vote metadata. */
@@ -75,17 +91,23 @@ export type RawVote = z.infer<typeof RawVoteSchema>;
 /** Validate projected member decisions, preserving null and missing decision codes. */
 export const RawVotingSchema = z.object({
   ID: RawId,
-  Language: z.enum(['DE', 'FR', 'IT']),
+  Language: RawLanguage,
   IdVote: RawId,
-  PersonNumber: RawInt32.nullish(),
+  BusinessNumber: RawInt32,
+  BusinessShortNumber: RawText,
+  BusinessTitle: RawText,
+  IdSession: RawInt32,
+  VoteEnd: RawDate,
+  VoteEndWithTimezone: RawDate,
+  PersonNumber: RawInt32,
   FirstName: RawText,
   LastName: RawText,
-  CantonID: RawInt32.nullish(),
+  CantonID: RawInt32,
   Canton: RawText,
   CantonName: RawText,
   ParlGroupCode: RawText,
   ParlGroupName: RawText,
-  Decision: RawInt32.nullish(),
+  Decision: RawInt32,
   DecisionText: RawText,
 });
 
@@ -106,9 +128,9 @@ export const VoteCoverageSchema = z
 export const VoteSummarySchema = z
   .object({
     voteId: z.string().describe('Vote.ID as a decimal string.'),
-    metadataLanguage: z
-      .enum(['de', 'fr', 'it'])
-      .describe('Selected metadata row language; published text is not translated.'),
+    metadataLanguage: MetadataLanguageSchema.describe(
+      'Selected metadata row language; published text is not translated.',
+    ),
     sourceUrl: z.string().describe('Exact HTTPS OData composite-key vote URL.'),
     businessId: z.string().optional().describe('Canonical BusinessNumber when published.'),
     businessShortNumber: z.string().optional().describe('Published business short number.'),
@@ -140,13 +162,45 @@ export type VoteSummary = z.infer<typeof VoteSummarySchema>;
 export const MemberDecisionSchema = z
   .object({
     votingId: z.string().describe('Voting.ID as a decimal string.'),
+    voteId: z
+      .string()
+      .optional()
+      .describe('History only: published IdVote, usable as voteId in groups mode.'),
+    businessId: z.string().optional().describe('History only: published canonical BusinessNumber.'),
+    businessShortNumber: z
+      .string()
+      .optional()
+      .describe('History only: published business short number.'),
+    businessTitle: z
+      .string()
+      .optional()
+      .describe('History only: published business title on the Voting row.'),
+    sessionId: z
+      .string()
+      .optional()
+      .describe('History only: published IdSession on the Voting row.'),
+    endTime: z
+      .string()
+      .optional()
+      .describe(
+        'History only: published vote end time, retaining its source offset when supplied.',
+      ),
     personNumber: z
       .string()
       .optional()
       .describe('Published PersonNumber, distinct from Person.ID.'),
     firstName: z.string().optional().describe('Published member first name.'),
     lastName: z.string().optional().describe('Published member last name.'),
-    cantonId: z.string().optional().describe('Published CantonID.'),
+    cantonId: z
+      .string()
+      .optional()
+      .describe(
+        'Canonical CantonNumber mapped from the published Canton abbreviation; joins canton references and member filters.',
+      ),
+    votingCantonId: z
+      .string()
+      .optional()
+      .describe('Raw Voting.CantonID, a numbering system distinct from canonical CantonNumber.'),
     cantonCode: z.string().optional().describe('Published Canton abbreviation.'),
     cantonName: z.string().optional().describe('Published canton name.'),
     groupCode: z.string().optional().describe('Parliamentary group code on this Voting row.'),
@@ -177,6 +231,12 @@ export const DecisionCountSchema = z
       .int()
       .optional()
       .describe('Original code; absent for missing or null Decision.'),
+    decisionTexts: z
+      .array(z.string().describe('One verbatim published DecisionText.'))
+      .optional()
+      .describe(
+        'Distinct published labels for this code in source-row order, including empty strings; absent only when no label exists.',
+      ),
     count: z
       .number()
       .int()
@@ -238,7 +298,7 @@ export function normalizeVote(raw: RawVote, language: Language): VoteSummary {
   return {
     voteId: String(raw.ID),
     metadataLanguage: language,
-    sourceUrl: `${PARLIAMENT_ORIGIN}/odata.svc/Vote(ID=${raw.ID},Language=${odataString(language.toUpperCase())})?$format=json`,
+    sourceUrl: `${odataEntityUrl('Vote', String(raw.ID), language)}?$format=json`,
     ...(raw.BusinessNumber != null && { businessId: String(raw.BusinessNumber) }),
     ...(raw.BusinessShortNumber != null && { businessShortNumber: raw.BusinessShortNumber }),
     ...(raw.BusinessTitle != null && { businessTitle: raw.BusinessTitle }),
@@ -256,13 +316,27 @@ export function normalizeVote(raw: RawVote, language: Language): VoteSummary {
 }
 
 /** Normalize one Voting row without applying present-day affiliations or decision translations. */
-export function normalizeMemberDecision(raw: RawVoting): MemberDecision {
+export function normalizeMemberDecision(
+  raw: RawVoting,
+  mode: 'selected' | 'history',
+): MemberDecision {
+  const cantonId = canonicalCantonId(raw.Canton);
+  const endTime = raw.VoteEndWithTimezone ?? raw.VoteEnd;
   return {
     votingId: String(raw.ID),
+    ...(mode === 'history' && {
+      voteId: String(raw.IdVote),
+      ...(raw.BusinessNumber != null && { businessId: String(raw.BusinessNumber) }),
+      ...(raw.BusinessShortNumber != null && { businessShortNumber: raw.BusinessShortNumber }),
+      ...(raw.BusinessTitle != null && { businessTitle: raw.BusinessTitle }),
+      ...(raw.IdSession != null && { sessionId: String(raw.IdSession) }),
+      ...(endTime != null && { endTime }),
+    }),
     ...(raw.PersonNumber != null && { personNumber: String(raw.PersonNumber) }),
     ...(raw.FirstName != null && { firstName: raw.FirstName }),
     ...(raw.LastName != null && { lastName: raw.LastName }),
-    ...(raw.CantonID != null && { cantonId: String(raw.CantonID) }),
+    ...(cantonId !== undefined && { cantonId }),
+    ...(raw.CantonID != null && { votingCantonId: String(raw.CantonID) }),
     ...(raw.Canton != null && { cantonCode: raw.Canton }),
     ...(raw.CantonName != null && { cantonName: raw.CantonName }),
     ...(raw.ParlGroupCode != null && { groupCode: raw.ParlGroupCode }),
@@ -274,14 +348,23 @@ export function normalizeMemberDecision(raw: RawVoting): MemberDecision {
 
 /** Every row contributes to exactly one numeric or absent decision bucket. */
 export function countDecisions(
-  rows: readonly Pick<MemberDecision, 'decisionCode'>[],
+  rows: readonly Pick<MemberDecision, 'decisionCode' | 'decisionText'>[],
 ): z.infer<typeof DecisionCountSchema>[] {
-  const counts = new Map<number | undefined, number>();
-  for (const row of rows) counts.set(row.decisionCode, (counts.get(row.decisionCode) ?? 0) + 1);
+  const counts = new Map<number | undefined, { count: number; labels: Set<string> }>();
+  for (const row of rows) {
+    let bucket = counts.get(row.decisionCode);
+    if (bucket === undefined) {
+      bucket = { count: 0, labels: new Set() };
+      counts.set(row.decisionCode, bucket);
+    }
+    bucket.count += 1;
+    if (row.decisionText !== undefined) bucket.labels.add(row.decisionText);
+  }
   return [...counts.entries()]
     .sort(([left], [right]) => (left === undefined ? 1 : right === undefined ? -1 : left - right))
-    .map(([decisionCode, count]) => ({
+    .map(([decisionCode, bucket]) => ({
       ...(decisionCode !== undefined && { decisionCode }),
-      count,
+      count: bucket.count,
+      ...(bucket.labels.size > 0 && { decisionTexts: [...bucket.labels] }),
     }));
 }

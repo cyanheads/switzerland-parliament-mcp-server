@@ -44,6 +44,241 @@ const clauses =
   "substringof('O''Brien é',Title) and substringof('A & B',SubmittedBy) and BusinessType eq 3 and BusinessStatus eq 9999 and SubmissionSession eq 50 and SubmissionDate ge datetime'2026-01-01T00:00:00' and SubmissionDate le datetime'2026-02-28T23:59:59.999'";
 
 describe('chparl_search_business', () => {
+  it.each([0, 1, 2, 3])('uses one count-free lookahead for %i author matches', async (size) => {
+    const rows = Array.from({ length: size }, (_, index) => ({
+      ...businessRow,
+      ID: 20991234 - index,
+    }));
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) => {
+        const url = new URL(request.url);
+        const top = Number(url.searchParams.get('$top'));
+        const skip = Number(url.searchParams.get('$skip'));
+        return Response.json({ d: rows.slice(skip, skip + top) });
+      },
+    });
+    const result = await runToolContract(searchBusinessTool, { author: 'Maillard', limit: 2 });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      businesses: rows.slice(0, 2).map((item) => ({ businessId: String(item.ID) })),
+      returnedCount: Math.min(size, 2),
+      hasMore: size > 2,
+    });
+    expect(result.structuredContent).not.toHaveProperty('totalCount');
+    if (size <= 2) expect(result.structuredContent).not.toHaveProperty('nextCursor');
+    expect(http.calls).toHaveLength(1);
+    const url = new URL(http.calls[0]?.request.url ?? '');
+    expect(url.searchParams.has('$inlinecount')).toBe(false);
+    expect(url.searchParams.get('$top')).toBe('3');
+    expectBusinessParity(result);
+  });
+
+  it('drains count-free author cursors without recounting, including a full tail and past-end', async () => {
+    const rows = [20991234, 20991233, 20991232, 20991231].map((ID) => ({ ...businessRow, ID }));
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) => {
+        const url = new URL(request.url);
+        const after = /ID lt (\d+)/.exec(url.searchParams.get('$filter') ?? '')?.[1];
+        const selected = rows.filter((item) => after === undefined || item.ID < Number(after));
+        const skip = Number(url.searchParams.get('$skip'));
+        return Response.json({
+          d: selected.slice(skip, skip + Number(url.searchParams.get('$top'))),
+        });
+      },
+    });
+    const input = { ...conjunction, limit: 2 };
+    const first = await runToolContract(searchBusinessTool, input);
+    const firstCursor = businessNextCursor(first);
+    const second = await runToolContract(searchBusinessTool, { ...input, cursor: firstCursor });
+    expect(second.structuredContent).toMatchObject({
+      businesses: [{ businessId: '20991232' }, { businessId: '20991231' }],
+      hasMore: false,
+    });
+    expect(second.structuredContent).not.toHaveProperty('nextCursor');
+    expect(second.structuredContent).not.toHaveProperty('totalCount');
+    // The cursor is filter-bound but can outlive source deletions.
+    rows.length = 0;
+    const past = await runToolContract(searchBusinessTool, { ...input, cursor: firstCursor });
+    expect(past.structuredContent).toMatchObject({ businesses: [], hasMore: false });
+    expect(past.structuredContent).not.toHaveProperty('nextCursor');
+    expect(past.structuredContent).not.toHaveProperty('totalCount');
+    expect(textContent(past)).toContain('No business remains after this cursor');
+    expect(http.calls).toHaveLength(3);
+    for (const { request } of http.calls) {
+      const url = new URL(request.url);
+      expect(url.searchParams.has('$inlinecount')).toBe(false);
+      expect(url.searchParams.get('$top')).toBe('3');
+      expect(url.searchParams.get('$filter')).toContain(clauses);
+      expect(url.searchParams.get('$orderby')).toBe('ID desc');
+    }
+    expect(new URL(http.calls[1]?.request.url ?? '').searchParams.get('$filter')).toBe(
+      `Language eq 'DE' and (${clauses} and ID lt 20991233)`,
+    );
+    for (const result of [first, second, past]) expectBusinessParity(result);
+  });
+
+  it('fills author lookahead through several source continuations without counting', async () => {
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) => {
+        const url = new URL(request.url);
+        const skip = Number(url.searchParams.get('$skip'));
+        const next = new URL(url);
+        next.searchParams.set('$skip', String(skip + 1));
+        return Response.json({
+          d: {
+            results: [{ ...businessRow, ID: 20991234 - skip }],
+            ...(skip < 2 && { __next: next.href }),
+          },
+        });
+      },
+    });
+    const result = await runToolContract(searchBusinessTool, { author: 'Maillard', limit: 2 });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      businesses: [{ businessId: '20991234' }, { businessId: '20991233' }],
+      returnedCount: 2,
+      hasMore: true,
+      provenance: {
+        sources: [
+          { url: expect.stringContaining('%24skip=0') },
+          { url: expect.stringContaining('%24skip=1') },
+          { url: expect.stringContaining('%24skip=2') },
+        ],
+      },
+    });
+    expect(result.structuredContent).not.toHaveProperty('totalCount');
+    expect(
+      http.calls.map(({ request }) => {
+        const url = new URL(request.url);
+        return [
+          url.searchParams.get('$skip'),
+          url.searchParams.get('$top'),
+          url.searchParams.has('$inlinecount'),
+        ];
+      }),
+    ).toEqual([
+      ['0', '3', false],
+      ['1', '2', false],
+      ['2', '1', false],
+    ]);
+    expect(
+      JSON.parse(Buffer.from(businessNextCursor(result), 'base64url').toString()),
+    ).toMatchObject({
+      lastBusinessId: '20991233',
+    });
+    expectBusinessParity(result);
+  });
+
+  it('continues author byte-fitted pages from delivered rows and reaches the held-back row', async () => {
+    const rows = Array.from({ length: 102 }, (_, index) => ({
+      ID: 20991234 - index,
+      Language: 'DE',
+      Title: `${index} ${'界'.repeat(100)}`,
+    }));
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) => {
+        const url = new URL(request.url);
+        const after = /ID lt (\d+)/.exec(url.searchParams.get('$filter') ?? '')?.[1];
+        const selected = rows.filter((item) => after === undefined || item.ID < Number(after));
+        return Response.json({ d: selected.slice(0, Number(url.searchParams.get('$top'))) });
+      },
+    });
+    const collected: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const result = await runToolContract(searchBusinessTool, {
+        author: 'Maillard',
+        limit: 101,
+        ...(cursor && { cursor }),
+      });
+      const items = searchBusinessTool.output.parse(result.structuredContent).businesses;
+      expect(items.length).toBeGreaterThan(0);
+      if (page === 0) expect(items.length).toBeLessThan(100);
+      expect(items.map((item) => item.businessId)).toEqual(
+        rows
+          .slice(collected.length, collected.length + items.length)
+          .map((item) => String(item.ID)),
+      );
+      collected.push(...items.map((item) => item.businessId));
+      expect(result.structuredContent).not.toHaveProperty('totalCount');
+      expect(result.structuredContent).toMatchObject({ hasMore: collected.length < 102 });
+      expectBusinessParity(result);
+      if (collected.length === 102) break;
+      cursor = businessNextCursor(result);
+      expect(JSON.parse(Buffer.from(cursor, 'base64url').toString())).toMatchObject({
+        lastBusinessId: collected.at(-1),
+      });
+    }
+    expect(collected).toEqual(rows.map((item) => String(item.ID)));
+    expect(
+      http.calls.every(({ request }) => !new URL(request.url).searchParams.has('$inlinecount')),
+    ).toBe(true);
+    expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$top')).toBe('101');
+  });
+
+  it('keeps counted non-author first pages and original-filter continuation recounts', async () => {
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) => {
+        const filter = new URL(request.url).searchParams.get('$filter');
+        return Response.json({
+          d: {
+            results: [{ ID: filter?.includes('ID lt') ? 20991233 : 20991234, Language: 'DE' }],
+            __count: filter?.includes('ID lt') ? '2' : '3',
+          },
+        });
+      },
+    });
+    const first = await runToolContract(searchBusinessTool, { query: 'fixed', limit: 1 });
+    const second = await runToolContract(searchBusinessTool, {
+      query: 'fixed',
+      limit: 1,
+      cursor: businessNextCursor(first),
+    });
+    expect(first.structuredContent).toMatchObject({ totalCount: 3, hasMore: true });
+    expect(second.structuredContent).toMatchObject({
+      businesses: [{ businessId: '20991233' }],
+      totalCount: 3,
+      hasMore: true,
+    });
+    expect(
+      http.calls.map(({ request }) => {
+        const url = new URL(request.url);
+        return [
+          url.searchParams.get('$filter'),
+          url.searchParams.get('$inlinecount'),
+          url.searchParams.get('$top'),
+          url.searchParams.get('$select'),
+        ];
+      }),
+    ).toEqual([
+      [
+        "Language eq 'DE' and (substringof('fixed',Title))",
+        'allpages',
+        '1',
+        expect.stringContaining('Title'),
+      ],
+      [
+        "Language eq 'DE' and (substringof('fixed',Title) and ID lt 20991234)",
+        'allpages',
+        '1',
+        expect.stringContaining('Title'),
+      ],
+      ["Language eq 'DE' and (substringof('fixed',Title))", 'allpages', '1', 'ID,Language'],
+    ]);
+    expectBusinessParity(first);
+    expectBusinessParity(second);
+  });
+
   it('hydrates exact-date committee identifiers without expanding the slow role query', async () => {
     http.reset();
     http.route({
@@ -141,15 +376,15 @@ describe('chparl_search_business', () => {
         limit: 20,
       },
       returnedCount: 1,
-      totalCount: 1,
       hasMore: false,
     });
     const url = new URL(http.calls[0]?.request.url ?? '');
     expect(url.pathname).toBe('/odata.svc/Business');
     expect(url.searchParams.get('$filter')).toBe(`Language eq 'DE' and (${clauses})`);
     expect(url.searchParams.get('$orderby')).toBe('ID desc');
-    expect(url.searchParams.get('$inlinecount')).toBe('allpages');
-    expect(url.searchParams.get('$top')).toBe('20');
+    expect(result.structuredContent).not.toHaveProperty('totalCount');
+    expect(url.searchParams.has('$inlinecount')).toBe(false);
+    expect(url.searchParams.get('$top')).toBe('21');
     expect(url.searchParams.get('$select')).not.toContain('Description');
     const decoded = expectBusinessParity(result);
     expect(decoded.links).toContain(businessSummary.sourceUrl);
@@ -157,7 +392,7 @@ describe('chparl_search_business', () => {
 
   it('counts the original whole query separately on a direct continuation', async () => {
     serve({ d: { results: [businessRow], __count: '3' } });
-    const first = await runToolContract(searchBusinessTool, { ...conjunction, limit: 1 });
+    const first = await runToolContract(searchBusinessTool, { query: 'original', limit: 1 });
     const cursor = businessNextCursor(first);
     expect(typeof cursor).toBe('string');
     http.reset();
@@ -173,7 +408,11 @@ describe('chparl_search_business', () => {
         });
       },
     });
-    const result = await runToolContract(searchBusinessTool, { ...conjunction, limit: 1, cursor });
+    const result = await runToolContract(searchBusinessTool, {
+      query: 'original',
+      limit: 1,
+      cursor,
+    });
     expect(result.structuredContent).toMatchObject({
       businesses: [{ businessId: '20991233' }],
       totalCount: 3,
@@ -183,9 +422,11 @@ describe('chparl_search_business', () => {
     expect(http.calls).toHaveLength(2);
     const urls = http.calls.map((call) => new URL(call.request.url));
     expect(urls[0]?.searchParams.get('$filter')).toBe(
-      `Language eq 'DE' and (${clauses} and ID lt 20991234)`,
+      "Language eq 'DE' and (substringof('original',Title) and ID lt 20991234)",
     );
-    expect(urls[1]?.searchParams.get('$filter')).toBe(`Language eq 'DE' and (${clauses})`);
+    expect(urls[1]?.searchParams.get('$filter')).toBe(
+      "Language eq 'DE' and (substringof('original',Title))",
+    );
     expect(urls[1]?.searchParams.get('$select')).toBe('ID,Language');
     expectBusinessParity(result);
   });
@@ -520,30 +761,33 @@ describe('chparl_search_business', () => {
     expect(http.calls).toHaveLength(0);
   });
 
-  it('preserves rate-limit recovery and removes raw upstream diagnostics', async () => {
-    http.reset();
-    http.route({
-      match: () => true,
-      respond: () =>
-        Response.json(
-          { error: { innererror: 'private-stack' } },
-          { status: 429, headers: { 'Retry-After': '999' } },
-        ),
-    });
-    const result = await runToolContract(searchBusinessTool, {});
-    expect(result.structuredContent).toMatchObject({
-      error: {
-        code: JsonRpcErrorCode.RateLimited,
-        data: {
-          reason: 'upstream_rate_limited',
-          retryAfter: '999',
-          recovery: { hint: expect.stringContaining('topic coverage') },
+  it.each([{}, { author: 'Maillard' }])(
+    'preserves rate-limit recovery and removes raw upstream diagnostics for %o',
+    async (input) => {
+      http.reset();
+      http.route({
+        match: () => true,
+        respond: () =>
+          Response.json(
+            { error: { innererror: 'private-stack' } },
+            { status: 429, headers: { 'Retry-After': '999' } },
+          ),
+      });
+      const result = await runToolContract(searchBusinessTool, input);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.RateLimited,
+          data: {
+            reason: 'upstream_rate_limited',
+            retryAfter: '999',
+            recovery: { hint: expect.stringContaining('topic coverage') },
+          },
         },
-      },
-    });
-    expect(textContent(result)).toContain('topic coverage');
-    expect(JSON.stringify(result)).not.toContain('private-stack');
-  });
+      });
+      expect(textContent(result)).toContain('topic coverage');
+      expect(JSON.stringify(result)).not.toContain('private-stack');
+    },
+  );
 
   it.each([
     { Language: 'FR' },

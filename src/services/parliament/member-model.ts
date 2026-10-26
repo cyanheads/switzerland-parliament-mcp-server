@@ -169,7 +169,5 @@ export const MemberProfileFiltersSchema = z.object({
 
 /** Normalized member-search parameters. */
 export type MemberSearchFilters = z.infer<typeof MemberSearchFiltersSchema>;
-/** Member profile section selector. */
-export type MemberSection = z.infer<typeof MemberSectionSchema>;
 /** One source affiliation record. */
 export type MemberSummary = z.infer<typeof MemberSummarySchema>;

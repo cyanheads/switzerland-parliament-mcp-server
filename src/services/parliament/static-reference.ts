@@ -46,7 +46,7 @@ const identifiers: readonly ReferenceItem[] = [
     id: 'reference',
     label: 'Reference identifiers',
     description:
-      'Server explanation: reference IDs are positive decimal strings in their metadata integer range. CantonNumber, PartyNumber, ParlGroupNumber, and CommitteeNumber identify the corresponding reference topics; session IDs are Session.ID.',
+      'Server explanation: reference IDs are positive decimal strings in their metadata integer range. CantonNumber, PartyNumber, ParlGroupNumber, and CommitteeNumber identify the corresponding reference topics; session IDs are Session.ID. Member decision cantonId uses canonical CantonNumber mapped from the published canton abbreviation; votingCantonId preserves the separate raw Voting.CantonID numbering.',
   },
   {
     id: 'subject',
@@ -64,7 +64,7 @@ const identifiers: readonly ReferenceItem[] = [
     id: 'vote',
     label: 'Vote identifiers',
     description:
-      'Server explanation: vote IDs are positive signed Int32 decimal strings. Select a vote before requesting member decisions or complete group totals.',
+      'Server explanation: vote IDs are positive signed Int32 decimal strings. Discover roll calls by businessId or sessionId, read member history by personNumber, or select a voteId for member decisions and complete group totals.',
   },
 ];
 

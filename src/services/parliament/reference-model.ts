@@ -4,7 +4,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
-import { IsoDaySchema } from './normalization.js';
+import { IsoDaySchema, MetadataLanguageSchema } from './normalization.js';
 
 /** Published reference dictionaries and server explanations available for paging. */
 export const ReferenceTopicSchema = z.enum([
@@ -82,7 +82,7 @@ export type ReferenceItem = z.infer<typeof ReferenceItemSchema>;
 export const ReferenceFiltersSchema = z
   .object({
     topic: ReferenceTopicSchema.describe('Requested reference topic.'),
-    language: z.enum(['de', 'fr', 'it']).describe('Requested metadata label language.'),
+    language: MetadataLanguageSchema.describe('Requested metadata label language.'),
     dateFrom: IsoDaySchema.optional().describe(
       'Inclusive session StartDate lower bound, if supplied.',
     ),

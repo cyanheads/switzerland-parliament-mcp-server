@@ -5,8 +5,17 @@
 
 import { z } from '@cyanheads/mcp-ts-core';
 import { serializationError } from '@cyanheads/mcp-ts-core/errors';
-import { Int32IdSchema, type Language, ODataDateSchema, odataString } from './normalization.js';
-import { PARLIAMENT_ORIGIN } from './odata-client.js';
+import {
+  Int32IdSchema,
+  type Language,
+  MetadataLanguageSchema,
+  RawDate,
+  RawId,
+  RawInt32,
+  RawLanguage,
+  RawText,
+} from './normalization.js';
+import { odataEntityUrl } from './odata-client.js';
 
 /** Canonical eight-digit business ID or an exact published short number; no century inference. */
 export const BusinessIdentifierSchema = z
@@ -81,36 +90,32 @@ export const BUSINESS_DETAIL_FIELDS = [
   ...Object.values(BUSINESS_TEXT_FIELDS),
 ] as const;
 
-const RawNumber = z.number().int().min(-2_147_483_648).max(2_147_483_647).nullish();
-const RawText = z.string().nullish();
-const RawDate = ODataDateSchema.nullish();
-
 /** Validate selected fields at the OData edge while ignoring additive source properties. */
 export const RawBusinessSchema = z.object({
-  ID: z.number().int().positive().max(2_147_483_647),
-  Language: z.enum(['DE', 'FR', 'IT']),
+  ID: RawId,
+  Language: RawLanguage,
   BusinessShortNumber: RawText,
   Title: RawText,
-  BusinessType: RawNumber,
+  BusinessType: RawInt32,
   BusinessTypeName: RawText,
   BusinessTypeAbbreviation: RawText,
-  BusinessStatus: RawNumber,
+  BusinessStatus: RawInt32,
   BusinessStatusText: RawText,
   BusinessStatusDate: RawDate,
   SubmissionDate: RawDate,
   SubmittedBy: RawText,
-  SubmissionCouncil: RawNumber,
+  SubmissionCouncil: RawInt32,
   SubmissionCouncilName: RawText,
-  SubmissionSession: RawNumber,
+  SubmissionSession: RawInt32,
   Modified: RawDate,
-  ResponsibleDepartment: RawNumber,
+  ResponsibleDepartment: RawInt32,
   ResponsibleDepartmentName: RawText,
   ResponsibleDepartmentAbbreviation: RawText,
-  FederalCouncilProposal: RawNumber,
+  FederalCouncilProposal: RawInt32,
   FederalCouncilProposalDate: RawDate,
-  FirstCouncil1: RawNumber,
+  FirstCouncil1: RawInt32,
   FirstCouncil1Name: RawText,
-  FirstCouncil2: RawNumber,
+  FirstCouncil2: RawInt32,
   FirstCouncil2Name: RawText,
   Tags: RawText,
   TagNames: RawText,
@@ -134,9 +139,9 @@ export type RawBusiness = z.infer<typeof RawBusinessSchema>;
 export const BusinessSummarySchema = z
   .object({
     businessId: z.string().describe('Canonical Business.ID as a decimal string.'),
-    metadataLanguage: z
-      .enum(['de', 'fr', 'it'])
-      .describe('Requested metadata row language; no text translation is implied.'),
+    metadataLanguage: MetadataLanguageSchema.describe(
+      'Requested metadata row language; no text translation is implied.',
+    ),
     sourceUrl: z.string().describe('Exact HTTPS OData entity URL for this metadata row.'),
     shortNumber: z.string().optional().describe('Published BusinessShortNumber, unchanged.'),
     title: z.string().optional().describe('Published business title.'),
@@ -167,11 +172,6 @@ export const BusinessSummarySchema = z
 /** Normalized summary used by business, vote, and debate workflows. */
 export type BusinessSummary = z.infer<typeof BusinessSummarySchema>;
 
-/** Exact composite-key source citation; these URLs use the verified OData entity-key syntax. */
-export function businessSourceUrl(id: string, language: string): string {
-  return `${PARLIAMENT_ORIGIN}/odata.svc/Business(ID=${id},Language=${odataString(language.toUpperCase())})?$format=json`;
-}
-
 /** Normalize only present values, retaining empty source strings. */
 export function normalizeBusiness(raw: RawBusiness, language: Language): BusinessSummary {
   if (raw.Language !== language.toUpperCase())
@@ -179,7 +179,7 @@ export function normalizeBusiness(raw: RawBusiness, language: Language): Busines
   return {
     businessId: String(raw.ID),
     metadataLanguage: language,
-    sourceUrl: businessSourceUrl(String(raw.ID), language),
+    sourceUrl: `${odataEntityUrl('Business', String(raw.ID), language)}?$format=json`,
     ...(raw.BusinessShortNumber != null && { shortNumber: raw.BusinessShortNumber }),
     ...(raw.Title != null && { title: raw.Title }),
     ...(raw.BusinessType != null && { typeId: String(raw.BusinessType) }),
@@ -241,7 +241,7 @@ export const BusinessOverviewSchema = BusinessSummarySchema.extend({
 /** Normalized search inputs echoed on both client surfaces. */
 export const BusinessSearchFiltersSchema = z
   .object({
-    language: z.enum(['de', 'fr', 'it']).describe('Metadata language.'),
+    language: MetadataLanguageSchema.describe('Metadata language.'),
     query: z.string().optional().describe('Exact title substring.'),
     author: z.string().optional().describe('Exact submitter-label substring.'),
     typeId: Int32IdSchema.optional().describe('Business type code.'),

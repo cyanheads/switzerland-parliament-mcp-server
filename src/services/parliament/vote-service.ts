@@ -1,15 +1,17 @@
 /**
- * @fileoverview Paged vote discovery and complete selected-roll-call aggregation.
+ * @fileoverview Paged business/session vote discovery, member history, and selected-roll-call aggregation.
  * @module services/parliament/vote-service
  */
 
 import type { z } from '@cyanheads/mcp-ts-core';
 import { serializationError } from '@cyanheads/mcp-ts-core/errors';
+import { CANTON_SOURCE } from './canton-mapping.js';
 import { type Language, odataInt32 } from './normalization.js';
 import { ODataClient, type ODataPage } from './odata-client.js';
 import {
   countDecisions,
   type GroupDecisionSchema,
+  HISTORY_VOTING_FIELDS,
   type MemberDecision,
   normalizeMemberDecision,
   normalizeVote,
@@ -24,12 +26,13 @@ import { remainingWorkflowMs, type WorkflowContext } from './workflow.js';
 
 const client = new ODataClient();
 
-/** List metadata only; selecting a roll call makes the cost of member retrieval explicit. */
+/** List metadata filtered by business, session, or both, without retrieving member rows. */
 export async function listVotes(
-  businessId: string,
+  businessId: string | undefined,
   language: Language,
   paging: { limit: number; offset: number },
   workflow: WorkflowContext,
+  sessionId?: string,
 ): Promise<ODataPage<VoteSummary>> {
   const page = await client.collection(
     {
@@ -37,15 +40,23 @@ export async function listVotes(
       language,
       select: VOTE_FIELDS,
       orderBy: [{ field: 'ID', direction: 'desc' }],
-      filter: `BusinessNumber eq ${odataInt32(businessId)}`,
+      filter: [
+        ...(businessId === undefined ? [] : [`BusinessNumber eq ${odataInt32(businessId)}`]),
+        ...(sessionId === undefined ? [] : [`IdSession eq ${odataInt32(sessionId)}`]),
+      ].join(' and '),
     },
     RawVoteSchema,
     paging,
     workflow,
   );
   for (const row of page.items)
-    if (String(row.BusinessNumber) !== businessId)
-      throw serializationError('Parliament returned a vote belonging to a different business.');
+    if (
+      (businessId !== undefined && String(row.BusinessNumber) !== businessId) ||
+      (sessionId !== undefined && String(row.IdSession) !== sessionId)
+    )
+      throw serializationError(
+        'Parliament returned a vote belonging to a different business or session.',
+      );
   return { ...page, items: page.items.map((row) => normalizeVote(row, language)) };
 }
 
@@ -68,31 +79,49 @@ export async function getVote(
   return normalizeVote(row, language);
 }
 
-function verifyVoting(row: RawVoting, voteId: string, language: Language): void {
-  if (String(row.IdVote) !== voteId || row.Language !== language.toUpperCase())
+function verifyVoting(row: RawVoting, voteId: string | undefined, language: Language): void {
+  if (
+    (voteId !== undefined && String(row.IdVote) !== voteId) ||
+    row.Language !== language.toUpperCase()
+  )
     throw serializationError(
       'Parliament returned a member decision for a different roll call or metadata language.',
     );
 }
 
-/** Read a member page with exact filtered totals and the affiliation published on each Voting row. */
+/** Read source affiliations and exact filtered totals; without voteId, page history newest roll call first. */
 export async function listMemberDecisions(
-  voteId: string,
+  voteId: string | undefined,
   language: Language,
   paging: { limit: number; offset: number },
   workflow: WorkflowContext,
   personNumber?: string,
+  scopes: { businessId?: string; sessionId?: string } = {},
 ): Promise<ODataPage<MemberDecision>> {
+  const mode = voteId === undefined ? 'history' : 'selected';
   const page = await client.collection(
     {
       entity: 'Voting',
       language,
-      select: VOTING_FIELDS,
-      orderBy: [
-        { field: 'PersonNumber', direction: 'asc' },
-        { field: 'ID', direction: 'asc' },
-      ],
-      filter: `IdVote eq ${odataInt32(voteId)}${personNumber === undefined ? '' : ` and PersonNumber eq ${odataInt32(personNumber)}`}`,
+      select: mode === 'history' ? HISTORY_VOTING_FIELDS : VOTING_FIELDS,
+      orderBy:
+        mode === 'history'
+          ? [
+              { field: 'IdVote', direction: 'desc' },
+              { field: 'ID', direction: 'desc' },
+            ]
+          : [
+              { field: 'PersonNumber', direction: 'asc' },
+              { field: 'ID', direction: 'asc' },
+            ],
+      filter: [
+        ...(voteId === undefined ? [] : [`IdVote eq ${odataInt32(voteId)}`]),
+        ...(personNumber === undefined ? [] : [`PersonNumber eq ${odataInt32(personNumber)}`]),
+        ...(scopes.businessId === undefined
+          ? []
+          : [`BusinessNumber eq ${odataInt32(scopes.businessId)}`]),
+        ...(scopes.sessionId === undefined ? [] : [`IdSession eq ${odataInt32(scopes.sessionId)}`]),
+      ].join(' and '),
     },
     RawVotingSchema,
     paging,
@@ -102,8 +131,19 @@ export async function listMemberDecisions(
     verifyVoting(row, voteId, language);
     if (personNumber !== undefined && String(row.PersonNumber) !== personNumber)
       throw serializationError('Parliament returned a member decision for a different person.');
+    if (
+      (scopes.businessId !== undefined && String(row.BusinessNumber) !== scopes.businessId) ||
+      (scopes.sessionId !== undefined && String(row.IdSession) !== scopes.sessionId)
+    )
+      throw serializationError(
+        'Parliament returned a member decision for a different business or session.',
+      );
   }
-  return { ...page, items: page.items.map(normalizeMemberDecision) };
+  if (page.items.length > 0) workflow.sources.push({ ...CANTON_SOURCE });
+  return {
+    ...page,
+    items: page.items.map((row) => normalizeMemberDecision(row, mode)),
+  };
 }
 
 /** Drain every source page before exposing complete group or vote counts; an empty source has no totals. */
@@ -120,7 +160,15 @@ export async function getGroupDecisions(
       {
         entity: 'Voting',
         language,
-        select: ['ID', 'Language', 'IdVote', 'Decision', 'ParlGroupCode', 'ParlGroupName'],
+        select: [
+          'ID',
+          'Language',
+          'IdVote',
+          'Decision',
+          'DecisionText',
+          'ParlGroupCode',
+          'ParlGroupName',
+        ],
         orderBy: [{ field: 'ID', direction: 'asc' }],
         filter: `IdVote eq ${odataInt32(voteId)}`,
       },
@@ -135,7 +183,7 @@ export async function getGroupDecisions(
     if (page.totalCount !== undefined) totalCount = page.totalCount;
     for (const row of page.items) {
       verifyVoting(row, voteId, language);
-      rows.push(normalizeMemberDecision(row));
+      rows.push(normalizeMemberDecision(row, 'selected'));
     }
     if (!page.hasMore) break;
     if (page.items.length === 0)
@@ -147,37 +195,22 @@ export async function getGroupDecisions(
     throw serializationError(
       'Parliament roll-call rows do not match the advertised complete count.',
     );
-  const groups = new Map<
-    string | undefined,
-    { groupCode?: string; groupName?: string; rows: MemberDecision[] }
-  >();
-  for (const row of rows) {
-    const existing = groups.get(row.groupCode);
-    if (existing) {
-      existing.rows.push(row);
-      if (existing.groupName === undefined && row.groupName !== undefined)
-        existing.groupName = row.groupName;
-    } else
-      groups.set(row.groupCode, {
-        ...(row.groupCode !== undefined && { groupCode: row.groupCode }),
-        ...(row.groupName !== undefined && { groupName: row.groupName }),
-        rows: [row],
-      });
-  }
-  const items: z.infer<typeof GroupDecisionSchema>[] = [...groups.values()]
-    .sort((left, right) =>
-      left.groupCode === undefined
-        ? 1
-        : right.groupCode === undefined
-          ? -1
-          : left.groupCode.localeCompare(right.groupCode),
+  // Unknown groups sort last; a group's name is the first one published on its rows.
+  const items: z.infer<typeof GroupDecisionSchema>[] = [
+    ...Map.groupBy(rows, (row) => row.groupCode),
+  ]
+    .sort(([left], [right]) =>
+      left === undefined ? 1 : right === undefined ? -1 : left.localeCompare(right),
     )
-    .map(({ groupCode, groupName, rows: memberRows }) => ({
-      ...(groupCode !== undefined && { groupCode }),
-      ...(groupName !== undefined && { groupName }),
-      memberRowCount: memberRows.length,
-      counts: countDecisions(memberRows),
-    }));
+    .map(([groupCode, memberRows]) => {
+      const groupName = memberRows.find((row) => row.groupName !== undefined)?.groupName;
+      return {
+        ...(groupCode !== undefined && { groupCode }),
+        ...(groupName !== undefined && { groupName }),
+        memberRowCount: memberRows.length,
+        counts: countDecisions(memberRows),
+      };
+    });
   remainingWorkflowMs(workflow);
   return {
     items,

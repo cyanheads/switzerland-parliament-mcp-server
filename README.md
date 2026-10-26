@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/switzerland-parliament-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/switzerland-parliament-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/switzerland-parliament-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/switzerland-parliament-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/switzerland-parliament-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/switzerland-parliament-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -19,11 +19,17 @@
 
 </div>
 
+<div align="center">
+
+**Public Hosted Server:** [https://switzerland-parliament.caseyjhand.com/mcp](https://switzerland-parliament.caseyjhand.com/mcp)
+
+</div>
+
 ---
 
 ## Overview
 
-Swiss Federal Assembly records from Curia Vista and the Amtliches Bulletin. Find parliamentary business, read its original texts and procedural history, follow the debate in either council, inspect Nationalrat roll calls, and look up members and declared interests. Uses the [public OData service](https://ws.parlament.ch/odata.svc/) without an API key; runs as a stdio process or a local Streamable HTTP server.
+Swiss Federal Assembly records from Curia Vista and the Amtliches Bulletin. Find parliamentary business, read its original texts and procedural history, follow the debate in either council, inspect Nationalrat roll calls, and look up members and declared interests. Uses the [public OData service](https://ws.parlament.ch/odata.svc/) without an API key; runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
 
 Results credit **Parlamentsdienste der Bundesversammlung, Bern**, with source URLs and download dates. This is an unofficial reproduction. The [Parliament's open-data conditions](https://www.parlament.ch/de/%C3%BCber-das-parlament/fakten-und-zahlen/open-data-web-services) apply to source content; underlying author rights remain intact.
 
@@ -43,66 +49,54 @@ Results credit **Parlamentsdienste der Bundesversammlung, Bern**, with source UR
 
 ### `chparl_search_business` <sub>tool</sub>
 
-- `query` matches one title substring; `author` matches the published submitter label, not every co-signatory. Optional `typeId`, `statusId`, `sessionId`, `committeeId`, `submittedFrom`, and `submittedTo` refine it; dates are inclusive and session means submission session
-- Newest canonical business IDs first, default 20/max 100 per page. Continue with `nextCursor` and unchanged filters; a mismatched cursor fails as `invalid_cursor`
-- Committee searches examine role candidates and return distinct businesses, so pages can be short and omit `totalCount`. Without a committee filter, `totalCount` is the original-filter business count when supplied
-- Pass a returned `businessId` to `chparl_get_business`, `chparl_get_votes`, or `chparl_search_transcripts`
+- `query` (title substring), `author` (published submitter label, not every co-signatory), `typeId`, `statusId`, `sessionId` (submission session), `committeeId`, and inclusive `submittedFrom` / `submittedTo`. Newest business IDs first, default 20/max 100
+- Continue with `nextCursor` and unchanged filters; a cursor from other filters fails as `invalid_cursor`. `totalCount` is reported only without author or committee filters. Author searches use an extra matching row to establish continuation; committee searches page role candidates, so pages can be short
 
 ---
 
 ### `chparl_get_business` <sub>tool</sub>
 
-- Accepts a canonical eight-digit `businessId` or exact published short number, such as `99.1234`; ambiguous short numbers fail as `ambiguous_business_number`. `overview` (default) returns metadata and `availableTextFields` with UTF-8 sizes
-- `section: "texts"` returns `textDocument.kind: "full" | "outline"`. Automatic disclosure becomes a field-size outline when several populated fields make the complete result reach 24,000 bytes; explicit `textFields` selections or one populated field return whole, even above that threshold
-- Select `description`, `initialSituation`, `proceedings`, `draftText`, `submittedText`, `reasonText`, `documentationText`, `motionText`, `federalCouncilResponseText`, or `federalCouncilProposalText`. Unpublished selections appear in `unavailableTextFields`; original HTML, whitespace, and line endings stay intact
-- `status_history`, `bills`, `related_business`, `preconsultations`, and `subjects` page independently: default 20/max 100 with `nextOffset`. Paging belongs only to these sections; `textFields` belongs only to `texts`
-- Missing business returns `found: false`. Linked bills are parliamentary records, not enacted-law text; use `subjects` to narrow a large debate
+- Canonical eight-digit `businessId` or an exact published short number such as `99.1234`. A short number matching several businesses fails as `ambiguous_business_number`, and a miss returns `found: false`
+- `overview` (default) returns metadata and `availableTextFields` with UTF-8 sizes. `texts` returns `textDocument.kind: "full" | "outline"`: several large fields become an outline, and named `textFields` always return whole
+- `status_history`, `bills`, `related_business`, `preconsultations`, and `subjects` page independently, default 20/max 100 with `nextOffset`. `subjects` IDs narrow `chparl_search_transcripts`; linked bills are parliamentary records, not enacted law
 
 ---
 
 ### `chparl_get_votes` <sub>tool</sub>
 
-- Start with `mode: "votes"` and `businessId` for roll-call metadata, default 10/max 50 per page. Then use a returned `voteId` with `mode: "members"` (default 50/max 100, optional `personNumber`) or `mode: "groups"` (complete, unpaged)
-- Member roll calls cover the **Nationalrat from the 2003 winter session**. Ständerat member decisions are unavailable here; an empty result does not establish that no vote occurred
-- `members` returns `decisionCounts.scope: "page"`; `groups` reads all published member rows before returning `scope: "vote"`, `complete: true`, and group totals. When member data is unavailable, complete zero-vote totals are not inferred
-- Counts use affiliations published on vote rows, not current memberships. Original decision labels, unknown codes, and missing decisions remain visible; documented codes include 1 yes, 2 no, 3 abstention, 6 excused under Art. 57 para. 4, and 7 president does not vote
-- Continue paged modes with `nextOffset`; `found: false` distinguishes a missing business or selected vote from an empty child collection
+- `mode: "votes"` with `businessId`, `sessionId`, or both lists roll calls (default 10/max 50). A returned `voteId` feeds `mode: "members"` (default 50/max 100, optional `personNumber`) or `mode: "groups"` (unpaged). Paged modes continue with `nextOffset`
+- `mode: "members"` with `personNumber` and no `voteId` pages that member's voting history, optionally narrowed by `businessId` and `sessionId`. Each history row carries its published vote, business, session, and time fields; selected-vote pages carry that context once in `vote`. `cantonId` uses the canton reference's numbering; `votingCantonId` preserves the source Voting identifier
+- `members` counts carry `decisionCounts.scope: "page"`. `groups` reads every published member row and returns `scope: "vote"`, `complete: true`, and per-group totals by the affiliation recorded on the vote. Count buckets retain every distinct published label in `decisionTexts`. Decision codes: 1 yes, 2 no, 3 abstention, 4 present, 5 did not participate, 6 excused under Art. 57 para. 4, 7 president does not vote, 8 resigned
+- **Nationalrat only, from the 2003 winter session.** An empty result does not establish that no vote occurred
 
 ---
 
 ### `chparl_search_transcripts` <sub>tool</sub>
 
-- Bulletin coverage begins with the **1999 winter session** and includes both councils. Supply at least `businessId`, `subjectId`, `personNumber`, `sessionId`, a date bound, or exact `transcriptId`; council alone is insufficient
-- `query` searches one original-text substring and additionally requires `sessionId` or a closed `dateFrom`/`dateTo` range of at most **31 inclusive calendar days**
-- Searches return metadata and `textSizeBytes` by default, default 20/max 100 per page. `includeText: true` returns whole passages, default 3/max 10. Continue with `nextOffset` and unchanged filters
-- Exact `transcriptId` defaults to full text and accepts only `language` and `includeText` alongside it; explicit `includeText: false` returns metadata. Transcript and subject IDs stay decimal strings
-- `businessId` and `subjectId` are mutually exclusive. A business search covers every associated subject up to 20; `business_scope_too_broad` directs larger debates through `chparl_get_business` section `subjects`, then one `subjectId`
-- `metadataLanguage` never translates the speaker's text; absent `languageOfText` stays unknown. `found` identifies exact-ID misses; `scopeFound` distinguishes a missing business from one with no passages
+- Both councils from the **1999 winter session**. Scope with `businessId` or `subjectId` (exclusive), `personNumber`, `sessionId`, or a date bound; `council` only narrows. `query` (original-text substring) also needs `sessionId` or a closed range of at most **31 calendar days**
+- Metadata with `textSizeBytes` by default (20/max 100); `includeText: true` returns whole passages (3/max 10); an exact `transcriptId` defaults to full text. Continue with `nextOffset`
+- A business search covers up to 20 debate subjects; more fails as `business_scope_too_broad`, so page `chparl_get_business` section `subjects` and pass one `subjectId`. `found` marks exact-ID misses, `scopeFound` a missing business
 
 ---
 
 ### `chparl_search_members` <sub>tool</sub>
 
-- `query` matches a published first, last, or official name substring. `membership` is `current` (default), `former`, or `all`; optional `council`, `cantonId`, `partyId`, and `groupId` refine it
-- Results are **MemberCouncil affiliation records**, not deduplicated people. Default 20/max 100 per page, continued with `nextOffset`
-- Use `personNumber` for profiles and member-decision filters; it need not equal `Person.ID`. Council selectors accept `N`/`S` and the exact German, French, or Italian council names
+- `query` (first, last, or official name substring), `membership` (`current` default, `former`, `all`), `council` (`N`/`S` or the German, French, or Italian council name), `cantonId`, `partyId`, `groupId`. Default 20/max 100, `nextOffset`
+- Rows are **MemberCouncil affiliation records**, not deduplicated people. Their `personNumber`, which need not equal `Person.ID`, feeds `chparl_get_member`, `chparl_get_votes`, and `chparl_search_transcripts`
 
 ---
 
 ### `chparl_get_member` <sub>tool</sub>
 
-- Requires `personNumber`. `overview` (default) returns parliamentary identity and every base MemberCouncil affiliation without paging
-- `council_terms`, `committees`, and `interests` page independently, default 20/max 100 with `nextOffset`; omit paging for `overview`
-- Committee rows are published memberships, not a complete historical committee ledger. A missing `paid` flag means unknown, and empty interests do not establish absence of conflicts of interest
-- Missing identity returns `found: false` with discovery guidance
+- Requires `personNumber`. `overview` (default) returns identity and every MemberCouncil affiliation, unpaged; a miss returns `found: false`
+- `council_terms`, `committees`, and `interests` page independently, default 20/max 100 with `nextOffset`. Committee rows are published memberships, not a historical ledger. A missing `paid` flag means unknown, and empty interests do not establish the absence of conflicts
 
 ---
 
 ### `chparl_list_reference` <sub>tool</sub>
 
-- Topics: `identifiers`, `coverage`, `languages`, `business_types`, `statuses`, `councils`, `cantons`, `parties`, `groups`, `committees`, and `sessions`. Use returned IDs in the other tools
-- Default 50/max 100 per page, continued with `nextOffset`. Only `sessions` accepts dates: `dateFrom` bounds session start, `dateTo` bounds session end, both inclusively
-- `statuses` is the official legacy/current vocabulary snapshot effective 1 July 2023, carrying `era`; unknown live codes remain visible. Identifier, coverage, and language explanations are static; other dictionaries are live
+- Static topics `identifiers`, `coverage`, `languages`, and `statuses` (the official vocabulary effective 1 July 2023, each code tagged `era: "legacy" | "current"`). Live dictionaries `business_types`, `councils`, `cantons`, `parties`, `groups`, `committees`, and `sessions`
+- Default 50/max 100, `nextOffset`. Only `sessions` accepts dates: `dateFrom` bounds the start and `dateTo` the end, inclusively
 
 ## Features
 
@@ -111,109 +105,45 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 Swiss Parliament-specific:
 
 - Keyless, read-only access to business, procedural relationships, Nationalrat roll calls, debate passages, members, and declared interests
-- `de` (default), `fr`, and `it` metadata without translation fallback. Completeness of every Italian field is not established; English and Romansh translations are not offered
-- Published text and HTML remain unchanged; an accompanying link/image reference index preserves original attributes and supplies clickable absolute HTTP(S) URLs where available
-- One 45-second deadline per complete workflow; narrow text scopes help with slow upstream searches
+- `de` (default), `fr`, and `it` metadata with no translation fallback; Italian completeness is not established. Bulletin text stays in the language the speaker used
+- Published text and HTML are returned unchanged, with an index of their links and images carrying absolute HTTP(S) URLs where the source supplies one
+- One 45-second deadline per complete workflow, covering joins and retries
 
 Agent-friendly output:
 
-- Both `content[]` and `structuredContent` carry the same records, provenance, filters, notices, and paging information. Multiline text and HTML are JSON-encoded in fenced text blocks for lossless recovery
-- Collections report `returnedCount`, `effectiveLimit` where paged, `hasMore`, and a continuation when available; `totalCount` appears only when known. Offset pages can change as live data updates
-- Collection replies fit whole records around a 24,000-byte result budget; fitting can shorten a page, never a returned field. An indivisible oversized record is returned whole with a notice; text selections, member overviews, and group totals also remain complete
-- Missing values stay unknown; empty results carry guidance, and rate limits return `upstream_rate_limited` with retry guidance
+- Provenance on every result: attribution to Parlamentsdienste der Bundesversammlung, plus the source URL and retrieval time of each upstream response
+- Whole-record pages: replies fit a 24,000-byte budget by returning fewer records, never shorter fields, and report `returnedCount`, `hasMore`, `totalCount` when known, and the continuation
+- One record on both surfaces: `content[]` carries every `structuredContent` field, with multiline text and HTML in JSON-encoded fenced blocks that decode back losslessly
+- Unknown stays unknown: absent source values are omitted rather than defaulted, empty results carry next-step guidance, and failures carry typed reasons such as `upstream_rate_limited`
 
 ## Getting started
 
-### Self-Hosted / Local
+Connect to the hosted instance, no install:
 
-Add the following to your MCP client configuration file.
-
-```json
-{
-  "mcpServers": {
-    "switzerland-parliament-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/switzerland-parliament-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
-    }
-  }
-}
+```sh
+claude mcp add --transport http switzerland-parliament-mcp-server https://switzerland-parliament.caseyjhand.com/mcp
 ```
 
-Or with npx (no Bun required):
+Or run it locally:
+
+```sh
+claude mcp add switzerland-parliament-mcp-server -- npx -y @cyanheads/switzerland-parliament-mcp-server
+```
+
+For other clients, add this to the MCP config file:
 
 ```json
 {
   "mcpServers": {
     "switzerland-parliament-mcp-server": {
-      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@cyanheads/switzerland-parliament-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
+      "args": ["-y", "@cyanheads/switzerland-parliament-mcp-server"]
     }
   }
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "switzerland-parliament-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "ghcr.io/cyanheads/switzerland-parliament-mcp-server:latest"]
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
-
-```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
-# Server listens at http://localhost:3010/mcp
-```
-
-### Prerequisites
-
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
-- No API key or account is required.
-
-### Installation
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/switzerland-parliament-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd switzerland-parliament-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Configure environment:**
-
-```sh
-cp .env.example .env
-# Optional: edit framework transport, auth, logging, or telemetry settings
-```
+For Docker or a source build, see [Running the server](#running-the-server).
 
 ## Configuration
 
@@ -236,6 +166,15 @@ See [`.env.example`](./.env.example) for the common framework overrides.
 
 ### Local development
 
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+
+```sh
+git clone https://github.com/cyanheads/switzerland-parliament-mcp-server.git
+cd switzerland-parliament-mcp-server
+bun install
+cp .env.example .env
+```
+
 - **Build and run the production version**:
 
   ```sh
@@ -253,6 +192,14 @@ See [`.env.example`](./.env.example) for the common framework overrides.
   bun run devcheck  # Lints, formats, type-checks, and more
   bun run test      # Runs the test suite
   ```
+
+### Docker
+
+```sh
+docker run --rm -p 3010:3010 ghcr.io/cyanheads/switzerland-parliament-mcp-server:latest
+```
+
+The image defaults to HTTP transport, stateless sessions, and logs to `/var/log/switzerland-parliament-mcp-server`. For stdio, use `"command": "docker"` with `"args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "ghcr.io/cyanheads/switzerland-parliament-mcp-server:latest"]`. Build locally with `docker build -t switzerland-parliament-mcp-server .`; `--build-arg OTEL_ENABLED=false` omits OpenTelemetry peers.
 
 ## Project structure
 

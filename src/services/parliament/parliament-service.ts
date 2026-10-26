@@ -5,19 +5,15 @@
 
 import { z } from '@cyanheads/mcp-ts-core';
 import { serializationError } from '@cyanheads/mcp-ts-core/errors';
-import { ODataDateSchema, odataDay } from './normalization.js';
+import { odataDay, RawDate, RawId, RawLanguage, RawText } from './normalization.js';
 import { ODataClient, type ODataPage, type ODataQuery } from './odata-client.js';
 import type { ReferenceFilters, ReferenceItem } from './reference-model.js';
 import { staticReference } from './static-reference.js';
 import { remainingWorkflowMs, type WorkflowContext } from './workflow.js';
 
-const RawInt32 = z.number().int().nonnegative().max(2_147_483_647);
-const RawId = RawInt32.positive();
-const RawText = z.string().nullish();
-const RawDate = ODataDateSchema.nullish();
 const RawReferenceSchema = z.object({
   ID: RawId,
-  Language: z.enum(['DE', 'FR', 'IT']),
+  Language: RawLanguage,
   BusinessTypeName: RawText,
   BusinessTypeAbbreviation: RawText,
   CouncilName: RawText,
@@ -36,7 +32,7 @@ const RawReferenceSchema = z.object({
   CommitteeNumber: RawId.optional(),
   CommitteeName: RawText,
   Abbreviation1: RawText,
-  Council: RawInt32.nullish(),
+  Council: z.number().int().nonnegative().max(2_147_483_647).nullish(),
   CommitteeTypeName: RawText,
   SessionName: RawText,
   Abbreviation: RawText,

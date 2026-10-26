@@ -12,6 +12,8 @@ import {
   odataInt32,
   odataInt64,
   odataString,
+  RawId,
+  RawLanguage,
 } from './normalization.js';
 import { ODataClient, type ODataPage, type ODataQuery } from './odata-client.js';
 import {
@@ -26,8 +28,8 @@ import type { WorkflowContext } from './workflow.js';
 const client = new ODataClient();
 const RawSubjectSchema = z.object({
   IdSubject: Int64IdSchema,
-  BusinessNumber: z.number().int().positive().max(2_147_483_647),
-  Language: z.enum(['DE', 'FR', 'IT']),
+  BusinessNumber: RawId,
+  Language: RawLanguage,
 });
 
 /** Exact lookup remains a single-item resolution and preserves missing-key semantics. */

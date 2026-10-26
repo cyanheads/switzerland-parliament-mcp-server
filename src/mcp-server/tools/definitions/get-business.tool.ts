@@ -12,25 +12,27 @@ import {
   BusinessTextFieldSchema,
   normalizeBusiness,
 } from '@/services/parliament/business-model.js';
-import { BusinessSectionItemSchema } from '@/services/parliament/business-relations.js';
 import {
-  businessOverview,
-  getBusinessSection,
-  resolveBusiness,
-} from '@/services/parliament/business-service.js';
+  BusinessSectionItemSchema,
+  listBusinessSection,
+} from '@/services/parliament/business-relations.js';
+import { businessOverview, resolveBusiness } from '@/services/parliament/business-service.js';
 import {
   BusinessTextDocumentSchema,
   businessTextDocument,
 } from '@/services/parliament/business-text.js';
-import { LanguageSchema } from '@/services/parliament/normalization.js';
+import { LanguageSchema, MetadataLanguageSchema } from '@/services/parliament/normalization.js';
 import { ProvenanceSchema, provenance } from '@/services/parliament/provenance.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import {
   COLLECTION_RESULT_LIMIT_BYTES,
+  clampNotice,
   completeResultBytes,
+  fieldTrailer,
   fitCollectionPage,
   formatParliamentResult,
-  renderField,
+  isPastEnd,
+  joinNotices,
 } from '../parliament-format.js';
 
 const EffectiveFiltersSchema = z
@@ -38,7 +40,7 @@ const EffectiveFiltersSchema = z
     businessId: z
       .string()
       .describe('Normalized canonical ID or exact published short number supplied.'),
-    language: z.enum(['de', 'fr', 'it']).describe('Requested metadata language.'),
+    language: MetadataLanguageSchema.describe('Requested metadata language.'),
     section: BusinessSectionSchema.describe('Selected readable unit.'),
     textFields: z
       .array(BusinessTextFieldSchema.describe('Selected complete original text field.'))
@@ -59,6 +61,45 @@ const EffectiveFiltersSchema = z
       .describe('Starting row offset, present only for relationships.'),
   })
   .describe('Effective business identifier, section, selectors, and paging defaults.');
+
+const EnrichmentSchema = z.object({
+  effectiveFilters: EffectiveFiltersSchema,
+  returnedCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe(
+      'Complete relationship rows delivered; absent for overview, texts, or missing business.',
+    ),
+  effectiveLimit: z
+    .number()
+    .int()
+    .positive()
+    .max(100)
+    .optional()
+    .describe('Effective relationship limit after clamping.'),
+  totalCount: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe('Whole selected relationship count when supplied by the source.'),
+  nextOffset: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe('Original offset plus delivered rows when more remain.'),
+  hasMore: z
+    .boolean()
+    .optional()
+    .describe('Whether selected relationship rows remain; absent for non-collection results.'),
+  notice: z
+    .string()
+    .optional()
+    .describe('Combined clamping, byte-fitting, empty-section, or past-end guidance.'),
+});
 
 /** Read independently addressable business sections without implying relationship completeness. */
 export const getBusinessTool = tool('chparl_get_business', {
@@ -130,53 +171,8 @@ export const getBusinessTool = tool('chparl_get_business', {
       .describe('Debate subjects usable in chparl_search_transcripts.'),
     provenance: ProvenanceSchema,
   }),
-  enrichment: {
-    effectiveFilters: EffectiveFiltersSchema,
-    returnedCount: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe(
-        'Complete relationship rows delivered; absent for overview, texts, or missing business.',
-      ),
-    effectiveLimit: z
-      .number()
-      .int()
-      .positive()
-      .max(100)
-      .optional()
-      .describe('Effective relationship limit after clamping.'),
-    totalCount: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe('Whole selected relationship count when supplied by the source.'),
-    nextOffset: z
-      .number()
-      .int()
-      .nonnegative()
-      .optional()
-      .describe('Original offset plus delivered rows when more remain.'),
-    hasMore: z
-      .boolean()
-      .optional()
-      .describe('Whether selected relationship rows remain; absent for non-collection results.'),
-    notice: z
-      .string()
-      .optional()
-      .describe('Combined clamping, byte-fitting, empty-section, or past-end guidance.'),
-  },
-  enrichmentTrailer: {
-    effectiveFilters: { render: (value) => renderField('effectiveFilters', value) },
-    returnedCount: { render: (value) => renderField('returnedCount', value) },
-    effectiveLimit: { render: (value) => renderField('effectiveLimit', value) },
-    totalCount: { render: (value) => renderField('totalCount', value) },
-    nextOffset: { render: (value) => renderField('nextOffset', value) },
-    hasMore: { render: (value) => renderField('hasMore', value) },
-    notice: { render: (value) => renderField('notice', value) },
-  },
+  enrichment: EnrichmentSchema.shape,
+  enrichmentTrailer: fieldTrailer(EnrichmentSchema.shape),
   errors: [
     {
       reason: 'ambiguous_business_number',
@@ -209,12 +205,14 @@ export const getBusinessTool = tool('chparl_get_business', {
       (!relationship && (input.limit !== undefined || input.offset !== undefined))
     )
       throw ctx.fail('incompatible_fields');
+    const requestedLimit = input.limit ?? 20;
+    const paging = { limit: Math.min(requestedLimit, 100), offset: input.offset ?? 0 };
     const filters = EffectiveFiltersSchema.parse({
       businessId: input.businessId,
       language: input.language,
       section: input.section,
       ...(input.textFields !== undefined && { textFields: input.textFields }),
-      ...(relationship && { limit: Math.min(input.limit ?? 20, 100), offset: input.offset ?? 0 }),
+      ...(relationship && paging),
     });
     return withWorkflow(ctx, async (workflow) => {
       const raw = await resolveBusiness(input.businessId, input.language, workflow, !relationship);
@@ -261,8 +259,7 @@ export const getBusinessTool = tool('chparl_get_business', {
         ctx.enrich(enrichment);
         return output;
       }
-      const paging = { limit: Math.min(input.limit ?? 20, 100), offset: input.offset ?? 0 };
-      const result = await getBusinessSection(
+      const result = await listBusinessSection(
         business.businessId,
         input.section,
         input.language,
@@ -277,26 +274,18 @@ export const getBusinessTool = tool('chparl_get_business', {
         subjects: 'subjects',
       }[input.section];
       const prepared = fitCollectionPage(result.items, (items, cut, oversized) => {
-        const notices: string[] = [];
-        if ((input.limit ?? 20) > 100)
-          notices.push(`Requested limit ${input.limit} was clamped to 100.`);
-        if (cut)
-          notices.push(
-            'Response byte fitting returned fewer whole relationship rows. Continue with nextOffset; no field was shortened.',
-          );
-        if (items.length === 0)
-          notices.push(
-            result.totalCount !== undefined &&
-              result.totalCount > 0 &&
-              paging.offset >= result.totalCount
-              ? `This offset is past the last relationship record. Call chparl_get_business with businessId:${business.businessId}, section:${input.section}, language:${input.language}, offset:0.`
-              : 'This business has no published records in this section. Use another chparl_get_business section or chparl_search_transcripts for its debate.',
-          );
-        if (oversized)
-          notices.push(
-            `One indivisible record or its provenance exceeds 24000 bytes and is returned whole. Retrieve it with chparl_get_business businessId:${business.businessId}, section:${input.section}, language:${input.language}, offset:${paging.offset}, limit:1.`,
-          );
         const hasMore = cut || result.hasMore;
+        const notice = joinNotices(
+          clampNotice(requestedLimit, paging.limit),
+          cut &&
+            'Response byte fitting returned fewer whole relationship rows. Continue with nextOffset; no field was shortened.',
+          items.length === 0 &&
+            (isPastEnd(result.totalCount, paging.offset)
+              ? `This offset is past the last relationship record. Call chparl_get_business with businessId:${business.businessId}, section:${input.section}, language:${input.language}, offset:0.`
+              : 'This business has no published records in this section. Use another chparl_get_business section or chparl_search_transcripts for its debate.'),
+          oversized &&
+            `One indivisible record or its provenance exceeds 24000 bytes and is returned whole. Retrieve it with chparl_get_business businessId:${business.businessId}, section:${input.section}, language:${input.language}, offset:${paging.offset}, limit:1.`,
+        );
         return {
           output: {
             found: true,
@@ -312,7 +301,7 @@ export const getBusinessTool = tool('chparl_get_business', {
             ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
             ...(hasMore && { nextOffset: paging.offset + items.length }),
             hasMore,
-            ...(notices.length > 0 && { notice: notices.join(' ') }),
+            ...(notice !== undefined && { notice }),
           },
         };
       });

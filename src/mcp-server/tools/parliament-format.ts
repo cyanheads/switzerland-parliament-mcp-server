@@ -4,11 +4,10 @@
  */
 
 import { escapeMarkdownInline, markdownImage, markdownLink } from '@cyanheads/mcp-ts-core/utils';
+import { utf8ByteLength } from '@/services/parliament/normalization.js';
 
 /** At-the-max collection replies fit below this complete MCP-result byte size. */
 export const COLLECTION_RESULT_LIMIT_BYTES = 24_000;
-
-const encoder = new TextEncoder();
 
 /** Render a string whose JSON decoding preserves CR/LF, raw HTML, and control characters exactly. */
 export function renderOriginalString(value: string): string {
@@ -62,6 +61,29 @@ export function formatParliamentResult(output: object): { type: 'text'; text: st
   return [{ type: 'text', text: renderField('', output) }];
 }
 
+/** Trailer renderers for every enrichment field, rendering exactly what completeResultBytes measures. */
+export function fieldTrailer<S extends object>(shape: S) {
+  return Object.fromEntries(
+    Object.keys(shape).map((key) => [key, { render: (value: unknown) => renderField(key, value) }]),
+  ) as { [K in keyof S]: { render: (value: unknown) => string } };
+}
+
+/** Join the applicable notices in disclosure order; undefined when none apply. */
+export function joinNotices(...notices: (string | false | undefined)[]): string | undefined {
+  const applicable = notices.filter((notice) => typeof notice === 'string');
+  return applicable.length > 0 ? applicable.join(' ') : undefined;
+}
+
+/** Disclose a requested page size reduced to the effective limit. */
+export function clampNotice(requested: number, limit: number): string | undefined {
+  return requested > limit ? `Requested limit ${requested} was clamped to ${limit}.` : undefined;
+}
+
+/** Whether an empty page's offset lies at or beyond a known nonzero total. */
+export function isPastEnd(totalCount: number | undefined, offset: number): boolean {
+  return totalCount !== undefined && totalCount > 0 && offset >= totalCount;
+}
+
 /** Measure the complete success result, including the framework's separate enrichment trailer block. */
 export function completeResultBytes(output: object, enrichment: object): number {
   const trailer = Object.entries(enrichment)
@@ -70,9 +92,9 @@ export function completeResultBytes(output: object, enrichment: object): number 
     .join('\n');
   const content = formatParliamentResult(output);
   if (trailer) content.push({ type: 'text', text: `\n\n${trailer}` });
-  return encoder.encode(
+  return utf8ByteLength(
     JSON.stringify({ structuredContent: { ...output, ...enrichment }, content }),
-  ).byteLength;
+  );
 }
 
 /** A prepared page contains the exact domain and enrichment used for its wire-size decision. */

@@ -1,6 +1,6 @@
 # switzerland-parliament-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 13:54:17
+Generated on: 2026-10-26 03:18:18
 
 ```text
 switzerland-parliament-mcp-server/
@@ -36,6 +36,8 @@ switzerland-parliament-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -156,6 +158,7 @@ switzerland-parliament-mcp-server/
 │   │       ├── business-relations.ts
 │   │       ├── business-service.ts
 │   │       ├── business-text.ts
+│   │       ├── canton-mapping.ts
 │   │       ├── member-model.ts
 │   │       ├── member-service.ts
 │   │       ├── normalization.ts
@@ -184,6 +187,7 @@ switzerland-parliament-mcp-server/
 │   │   └── tools/
 │   │       ├── business-detail.test.ts
 │   │       ├── business-search.test.ts
+│   │       ├── date-ranges.test.ts
 │   │       ├── list-reference.test.ts
 │   │       ├── member-tools.test.ts
 │   │       ├── parliament-format.test.ts
@@ -194,6 +198,7 @@ switzerland-parliament-mcp-server/
 │   ├── services/
 │   │   └── parliament/
 │   │       ├── business-text.test.ts
+│   │       ├── canton-mapping.test.ts
 │   │       ├── member-service.test.ts
 │   │       ├── normalization.test.ts
 │   │       ├── odata-client.test.ts
@@ -218,7 +223,9 @@ switzerland-parliament-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json

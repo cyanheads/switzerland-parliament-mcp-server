@@ -47,6 +47,64 @@ function collection(limit = 3, offset = 0, signal = new AbortController().signal
 }
 
 describe('OData request and complete pages', () => {
+  it('omits optional counts through recursive count-free source continuations', async () => {
+    respond((request) => {
+      const url = new URL(request.url);
+      const skip = Number(url.searchParams.get('$skip'));
+      const next = new URL(url);
+      next.searchParams.set('$skip', String(skip + 1));
+      return Response.json({
+        d: {
+          results: [{ ID: skip + 1 }],
+          ...(skip < 2 && { __next: next.href }),
+        },
+      });
+    });
+    const result = await withWorkflow(createMockContext(), (workflow) =>
+      new ODataClient().collection(
+        { ...query, includeCount: false },
+        row,
+        { limit: 4, offset: 0 },
+        workflow,
+      ),
+    );
+    expect(result).toEqual({ items: [{ ID: 1 }, { ID: 2 }, { ID: 3 }], hasMore: false });
+    expect(
+      http.calls.map(({ request }) => {
+        const url = new URL(request.url);
+        return [
+          url.searchParams.get('$skip'),
+          url.searchParams.get('$top'),
+          url.searchParams.has('$inlinecount'),
+        ];
+      }),
+    ).toEqual([
+      ['0', '4', false],
+      ['1', '3', false],
+      ['2', '2', false],
+    ]);
+  });
+
+  it('rejects a continuation that introduces a count into a count-free query', async () => {
+    respond((request) => {
+      const next = new URL(request.url);
+      next.searchParams.set('$skip', '1');
+      next.searchParams.set('$inlinecount', 'allpages');
+      return Response.json({ d: { results: [{ ID: 1 }], __next: next.href } });
+    });
+    await expect(
+      withWorkflow(createMockContext(), (workflow) =>
+        new ODataClient().collection(
+          { ...query, includeCount: false },
+          row,
+          { limit: 3, offset: 0 },
+          workflow,
+        ),
+      ),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.SerializationError });
+    expect(http.calls).toHaveLength(1);
+  });
+
   it('builds an encoded fixed-origin language-constrained query', () => {
     const url = buildODataUrl(query, 3, 9);
     expect(url.origin).toBe('https://ws.parlament.ch');

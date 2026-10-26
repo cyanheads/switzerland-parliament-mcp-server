@@ -22,7 +22,7 @@ import {
 import { remainingWorkflowMs, type WorkflowContext } from './workflow.js';
 
 /** Verified Parliament OData origin; callers cannot choose a server. */
-export const PARLIAMENT_ORIGIN = 'https://ws.parlament.ch';
+const PARLIAMENT_ORIGIN = 'https://ws.parlament.ch';
 
 /** Entity sets used by the record-research workflows. */
 export type ParliamentEntity =
@@ -61,11 +61,18 @@ export type ParliamentEntity =
   | 'Committee'
   | 'Session';
 
+/** Exact composite-key entity URL citing one source record; `key` is a validated OData literal. */
+export function odataEntityUrl(entity: ParliamentEntity, key: string, language: Language): string {
+  return `${PARLIAMENT_ORIGIN}/odata.svc/${entity}(ID=${key},Language=${odataString(language.toUpperCase())})`;
+}
+
 /** Internal typed query options; no caller-authored query expression or URL reaches this API. */
 export interface ODataQuery {
   readonly entity: ParliamentEntity;
   readonly expand?: readonly string[];
   readonly filter?: string;
+  /** Request a whole-query count unless explicitly disabled for an expensive source predicate. */
+  readonly includeCount?: boolean;
   readonly language: Language;
   readonly orderBy: readonly { readonly field: string; readonly direction: 'asc' | 'desc' }[];
   readonly select: readonly string[];
@@ -154,14 +161,14 @@ export function buildODataUrl(query: ODataQuery, limit: number, offset: number):
     '$orderby',
     query.orderBy.map(({ field, direction }) => `${field} ${direction}`).join(','),
   );
-  url.searchParams.set('$inlinecount', 'allpages');
+  if (query.includeCount !== false) url.searchParams.set('$inlinecount', 'allpages');
   url.searchParams.set('$top', String(limit));
   url.searchParams.set('$skip', String(offset));
   return url;
 }
 
 /** Validate a server-provided continuation without interpreting its opaque skiptoken. */
-export function validateContinuation(
+function validateContinuation(
   value: string,
   original: URL,
   remaining: number,

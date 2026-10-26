@@ -7,13 +7,13 @@ import { createHash } from 'node:crypto';
 import { z } from '@cyanheads/mcp-ts-core';
 import { validationError } from '@cyanheads/mcp-ts-core/errors';
 import type { BusinessSearchFilters } from './business-model.js';
-import { Int32IdSchema } from './normalization.js';
+import { Int32IdSchema, MetadataLanguageSchema } from './normalization.js';
 
 const CursorSchema = z
   .object({
     version: z.literal(1),
     fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-    language: z.enum(['de', 'fr', 'it']),
+    language: MetadataLanguageSchema,
     order: z.literal('business_id_desc'),
     route: z.enum(['business', 'committee']),
     lastBusinessId: Int32IdSchema,
