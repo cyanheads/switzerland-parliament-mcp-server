@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: switzerland-parliament-mcp-server
+abstract: "Search Swiss parliamentary business, votes, debates, members, and declared interests via MCP. STDIO or Streamable HTTP."
+type: software
+authors:
+  - family-names: Hand
+    given-names: Casey
+    orcid: "https://orcid.org/0009-0009-3726-568X"
+repository-code: "https://github.com/cyanheads/switzerland-parliament-mcp-server"
+license: Apache-2.0
+doi: 10.5281/zenodo.24193499
+keywords:
+  - mcp
+  - model-context-protocol
+  - switzerland
+  - parliament
+  - curia-vista
+  - votes
+  - open-data
