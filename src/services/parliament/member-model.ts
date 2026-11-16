@@ -66,6 +66,20 @@ export const MemberSummarySchema = z
   })
   .describe('One published MemberCouncil affiliation record.');
 
+/** A member-search row: the MemberCouncil record, plus the membership function on committee rosters. */
+export const MemberSearchRowSchema = MemberSummarySchema.extend({
+  committeeFunctionId: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      'Committee searches only: published CommitteeFunction code, such as 1 Mitglied, 2 Präsident/in, or 6 Vizepräsident/in.',
+    ),
+  committeeFunctionName: text('Committee searches only: published CommitteeFunctionName.'),
+}).describe(
+  'One published MemberCouncil affiliation record; on committee searches, one committee membership.',
+);
+
 /** One historical council record; its GUID is not a Person or MemberCouncil key. */
 export const CouncilTermSchema = z
   .object({
@@ -132,8 +146,9 @@ export const MemberSearchFiltersSchema = z.object({
   language: LanguageSchema.describe('Effective metadata language.'),
   query: text('Trimmed upstream substring search.'),
   membership: MembershipSchema.describe(
-    'current filters Active true; former false; all omits Active.',
+    'current filters Active true; former false; all omits Active. Committee rosters are the published current composition and send no Active filter.',
   ),
+  committeeId: id('Effective CommitteeNumber whose current roster is listed.'),
   council: z.enum(['N', 'S']).optional().describe('Effective council filter.'),
   cantonId: id('Effective canton filter.'),
   partyId: id('Effective party filter.'),
@@ -171,3 +186,5 @@ export const MemberProfileFiltersSchema = z.object({
 export type MemberSearchFilters = z.infer<typeof MemberSearchFiltersSchema>;
 /** One source affiliation record. */
 export type MemberSummary = z.infer<typeof MemberSummarySchema>;
+/** One member-search row, with committee function fields on committee rosters. */
+export type MemberSearchRow = z.infer<typeof MemberSearchRowSchema>;

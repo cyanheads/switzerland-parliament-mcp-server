@@ -122,6 +122,13 @@ export const searchBusinessTool = tool('chparl_search_business', {
       recovery: 'Restart chparl_search_business without cursor, preserving the intended filters.',
     },
     {
+      reason: 'request_too_long',
+      code: JsonRpcErrorCode.ValidationError,
+      thrownBy: 'service',
+      when: 'The text filters make the URL-encoded Parliament request longer than its 2048-byte query-string limit.',
+      recovery: 'Shorten the text filters and retry this tool.',
+    },
+    {
       reason: 'upstream_rate_limited',
       code: JsonRpcErrorCode.RateLimited,
       retryable: true,

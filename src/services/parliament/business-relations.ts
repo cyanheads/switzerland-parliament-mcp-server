@@ -58,56 +58,117 @@ const RawSectionSchema = z.object({
   PublishedNotes: RawText,
 });
 
-/** Complete selected procedural fields; absent source values remain unknown. */
-export const BusinessSectionItemSchema = z
-  .object({
-    id: z
-      .string()
-      .optional()
-      .describe('Published relationship GUID; subjects instead carry subjectId.'),
-    statusId: z.string().optional().describe('Published status code.'),
-    statusName: z.string().optional().describe('Published historical status name.'),
-    date: z.string().optional().describe('Published status date.'),
-    isMotionInSecondCouncil: z
-      .boolean()
-      .optional()
-      .describe('Published second-council motion flag.'),
-    newKey: z.number().int().optional().describe('Published NewKey value.'),
-    modifiedAt: z.string().optional().describe('Source modification date.'),
-    billNumber: z.number().int().optional().describe('Published bill number within the business.'),
-    billTypeId: z.string().optional().describe('Published bill type code.'),
-    billTypeName: z.string().optional().describe('Published bill type name.'),
-    title: z.string().optional().describe('Published bill or debate-subject title.'),
-    statusText: z.string().optional().describe('Published bill status label.'),
-    statusDate: z.string().optional().describe('Published bill status date.'),
-    submissionDate: z.string().optional().describe('Published bill submission date.'),
-    sourceUrl: z.string().optional().describe('Exact HTTPS source entity URL for a linked bill.'),
-    relatedBusinessId: z.string().optional().describe('Related canonical business ID.'),
-    shortNumber: z.string().optional().describe('Related business published short number.'),
-    typeId: z.string().optional().describe('Related business type code.'),
-    typeName: z.string().optional().describe('Related business type name.'),
-    typeAbbreviation: z.string().optional().describe('Related business type abbreviation.'),
-    priorityCode: z.string().optional().describe('Published relationship priority code.'),
-    billId: z.string().optional().describe('Linked bill GUID.'),
-    committeeId: z.string().optional().describe('Published committee number.'),
-    committeeName: z.string().optional().describe('Published committee name.'),
-    committeeAbbreviation: z.string().optional().describe('Published Abbreviation value.'),
-    committeeAbbreviation1: z.string().optional().describe('Published Abbreviation1 value.'),
-    committeeAbbreviation2: z.string().optional().describe('Published Abbreviation2 value.'),
-    preconsultationDate: z.string().optional().describe('Published preconsultation date.'),
-    treatmentCategory: z.string().optional().describe('Published treatment category.'),
-    subjectId: z.string().optional().describe('Exact Int64 debate-subject ID.'),
-    businessId: z
-      .string()
-      .optional()
-      .describe('Canonical business ID for this subject relationship.'),
-    sortOrder: z.number().int().optional().describe('Published subject order.'),
-    publishedNotes: z.string().optional().describe('Original published subject notes.'),
-  })
-  .describe('One complete procedural relationship row for the selected section.');
+/**
+ * Every field a relationship mapping can emit; absent source values remain unknown. Each row schema
+ * below picks exactly the fields its section's `$select` lets the mapping emit: the tool's output
+ * parse strips any key a row omits, so a mapped field left out of its pick is lost from both surfaces.
+ * Picks list keys in this schema's order because a pick's key order is the order results carry.
+ */
+const BusinessSectionItemSchema = z.object({
+  id: z.string().optional().describe('Published record GUID.'),
+  statusId: z.string().optional().describe('Published status code.'),
+  statusName: z.string().optional().describe('Published historical status name.'),
+  date: z.string().optional().describe('Published status date.'),
+  isMotionInSecondCouncil: z.boolean().optional().describe('Published second-council motion flag.'),
+  newKey: z.number().int().optional().describe('Published NewKey value.'),
+  modifiedAt: z.string().optional().describe('Source modification date.'),
+  billNumber: z.number().int().optional().describe('Published bill number within the business.'),
+  billTypeId: z.string().optional().describe('Published bill type code.'),
+  billTypeName: z.string().optional().describe('Published bill type name.'),
+  title: z.string().optional().describe('Published title.'),
+  statusText: z.string().optional().describe('Published bill status label.'),
+  statusDate: z.string().optional().describe('Published bill status date.'),
+  submissionDate: z.string().optional().describe('Published bill submission date.'),
+  sourceUrl: z.string().optional().describe('Exact HTTPS source entity URL for a linked bill.'),
+  relatedBusinessId: z.string().optional().describe('Related canonical business ID.'),
+  shortNumber: z.string().optional().describe('Related business published short number.'),
+  typeId: z.string().optional().describe('Related business type code.'),
+  typeName: z.string().optional().describe('Related business type name.'),
+  typeAbbreviation: z.string().optional().describe('Related business type abbreviation.'),
+  priorityCode: z.string().optional().describe('Published relationship priority code.'),
+  billId: z.string().optional().describe('Linked bill GUID.'),
+  committeeId: z.string().optional().describe('Published committee number.'),
+  committeeName: z.string().optional().describe('Published committee name.'),
+  committeeAbbreviation: z.string().optional().describe('Published Abbreviation value.'),
+  committeeAbbreviation1: z.string().optional().describe('Published Abbreviation1 value.'),
+  committeeAbbreviation2: z.string().optional().describe('Published Abbreviation2 value.'),
+  preconsultationDate: z.string().optional().describe('Published preconsultation date.'),
+  treatmentCategory: z.string().optional().describe('Published treatment category.'),
+  subjectId: z.string().optional().describe('Exact Int64 debate-subject ID.'),
+  businessId: z
+    .string()
+    .optional()
+    .describe('Canonical business ID for this subject relationship.'),
+  sortOrder: z.number().int().optional().describe('Published subject order.'),
+  publishedNotes: z.string().optional().describe('Original published subject notes.'),
+});
 
-/** A business section with independent source paging. */
-export type BusinessSectionItem = z.infer<typeof BusinessSectionItemSchema>;
+/** Any relationship row before the tool's per-section output parse. */
+type BusinessSectionItem = z.infer<typeof BusinessSectionItemSchema>;
+
+/** One `statusHistory` row of chparl_get_business. */
+export const StatusHistoryRowSchema = BusinessSectionItemSchema.pick({
+  id: true,
+  statusId: true,
+  statusName: true,
+  date: true,
+  isMotionInSecondCouncil: true,
+  newKey: true,
+  modifiedAt: true,
+}).describe('One published status-history row.');
+
+/** One `bills` row of chparl_get_business. */
+export const BillRowSchema = BusinessSectionItemSchema.pick({
+  id: true,
+  statusId: true,
+  modifiedAt: true,
+  billNumber: true,
+  billTypeId: true,
+  billTypeName: true,
+  title: true,
+  statusText: true,
+  statusDate: true,
+  submissionDate: true,
+  sourceUrl: true,
+}).describe('One linked bill row.');
+
+/** One `relatedBusiness` row of chparl_get_business. */
+export const RelatedBusinessRowSchema = BusinessSectionItemSchema.pick({
+  id: true,
+  modifiedAt: true,
+  title: true,
+  relatedBusinessId: true,
+  shortNumber: true,
+  typeId: true,
+  typeName: true,
+  typeAbbreviation: true,
+  priorityCode: true,
+}).describe('One related-business row.');
+
+/** One `preconsultations` row of chparl_get_business. */
+export const PreconsultationRowSchema = BusinessSectionItemSchema.pick({
+  id: true,
+  modifiedAt: true,
+  billNumber: true,
+  billId: true,
+  committeeId: true,
+  committeeName: true,
+  committeeAbbreviation: true,
+  committeeAbbreviation1: true,
+  committeeAbbreviation2: true,
+  preconsultationDate: true,
+  treatmentCategory: true,
+}).describe('One committee preconsultation row.');
+
+/** One `subjects` row of chparl_get_business. */
+export const SubjectRowSchema = BusinessSectionItemSchema.pick({
+  modifiedAt: true,
+  title: true,
+  subjectId: true,
+  businessId: true,
+  sortOrder: true,
+  publishedNotes: true,
+}).describe('One debate-subject row.');
 
 /** Relationship sections accepted by the direct paged reader. */
 export type BusinessRelationshipSection = Exclude<

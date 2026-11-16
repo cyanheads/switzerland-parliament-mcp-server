@@ -2,8 +2,8 @@
 
 **Server:** switzerland-parliament-mcp-server
 **Version:** 0.1.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
@@ -48,7 +48,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 All seven tools are read-only, idempotent public-source lookups. Definitions live in `src/mcp-server/tools/definitions/`, register directly in `src/index.ts`, and use `chparl_` names.
 
-`chparl_search_business` discovers canonical IDs; `chparl_get_business` reads one section at a time. `chparl_get_votes` discovers roll calls by business/session, reads a person's voting history directly, or selects a roll call for member decisions and complete group counts. `chparl_search_transcripts` joins business through debate subjects. Member workflows use `PersonNumber`, never assume it equals `Person.ID`.
+`chparl_search_business` discovers canonical IDs; `chparl_get_business` reads one section at a time. `chparl_get_votes` discovers roll calls by business/session, reads a person's voting history directly, or selects a roll call for member decisions and complete group counts. `chparl_search_transcripts` joins business through debate subjects and maps delivered passages back through a best-effort `subjectBusinesses` lookup (batched by encoded length, its own 10-second bound, degrading with a notice on any upstream failure; only cancellation, the workflow deadline, or a programmer error fail the call). Member workflows use `PersonNumber`, never assume it equals `Person.ID`. `chparl_search_members` with `committeeId` pages that committee's current `MemberCommittee` memberships through the `MembersCouncil` expansion; `membership` `former`/`all` fails as `incompatible_fields`, and `committeeFound` separates an unknown committee from an empty roster.
 
 `chparl_list_reference` resolves source codes before discovery. For example:
 
@@ -63,10 +63,12 @@ Its definition validates topic-specific dates, resolves effective filters, calls
 - Metadata language is `de`, `fr`, or `it`; it never translates Bulletin text. Preserve source strings, HTML, line endings, unknown codes, and absent values.
 - Every successful result carries `provenance` with attribution, source URLs, and actual download or snapshot dates.
 - Collection pages fit whole rows to the 24,000-byte complete-result budget. Preserve an indivisible oversized row with a notice; never shorten fields.
+- The source serves URL-encoded query strings of at most 2,048 bytes; `ODataClient` refuses a longer request before dispatch as ValidationError `request_too_long`. Every server-built ID list must fit at maximum ID width.
+- Each `chparl_get_business` relationship array has its own row schema picking exactly the fields its section's `$select` lets the mapping emit, in the superset's key order; a mapped field missing from its pick is dropped from both surfaces.
 - Business searches continue with `nextCursor`; other paged sections use `nextOffset` based on delivered rows. Author searches omit counts and use one extra matching row; committee pages count role candidates and omit a distinct business total.
 - Vote rows use canonical `CantonNumber` for `cantonId` and retain source `Voting.CantonID` as `votingCantonId`. Decision buckets preserve all distinct published labels in `decisionTexts`, including unknown codes.
 - Business text selection returns whole named fields; automatic overflow can return `textDocument.kind: "outline"`. Member page counts have `scope: "page"`; complete vote/group counts require `mode: "groups"`.
-- No domain environment variables, credentials, resources, prompts, persistent cache, or background tasks are required.
+- No domain environment variables, credentials, domain resources, prompts, persistent cache, or background tasks are required; the only resources are the published skill's `skill://` files, served by the SDK.
 
 ### Server identity and lifecycle
 
@@ -78,6 +80,7 @@ await createApp({
     searchMembersTool, getMemberTool, listReferenceTool],
   resources: [],
   prompts: [],
+  skills: 'skills',
   sessionMode: 'stateless',
   setup() {
     initParliamentService();
@@ -113,7 +116,7 @@ if (input.mode === 'groups' && (input.personNumber !== undefined ||
 }
 ```
 
-Service errors carry stable reasons such as `ambiguous_business_number`, `invalid_cursor`, and `upstream_rate_limited`. Exact identifier misses use the documented `found: false` result; valid empty collections remain successful. Never convert upstream outages, malformed payloads, or failed joins into empty data.
+Service errors carry stable reasons such as `ambiguous_business_number`, `invalid_cursor`, `request_too_long`, and `upstream_rate_limited`. Exact identifier misses use the documented `found: false` result; valid empty collections remain successful. Never convert upstream outages, malformed payloads, or failed joins into empty data.
 
 Catch only to classify a boundary failure or preserve cancellation/deadline precedence. Every tool workflow uses `withWorkflow`; services take its explicit context. See the framework protocol and `api-errors` skill for the full error reference.
 
@@ -122,6 +125,8 @@ Catch only to classify a boundary failure or preserve cancellation/deadline prec
 ## Structure
 
 ```text
+skills/
+  switzerland-parliament-guide/         # Published agent skill (served as skill://)
 src/
   index.ts                              # createApp() registration and setup
   mcp-server/tools/
@@ -152,7 +157,7 @@ tests/
 
 Development skills live in `framework-skills/`; read them when a task matches, or run `bun run list-skills` for the registry. Framework-managed skills carry `metadata.audience: external` and are synced by maintenance. Server-owned development skills omit that marker.
 
-Root `skills/` is a separate, opt-in tree for agents that install the server, authored with `add-skill`. Maintenance never creates or modifies it. A published tree ships through npm, plugins, and MCPB; Docker delivery and `createApp({ skills: 'skills' })` require explicit adoption. This server does not publish skills.
+Root `skills/` is a separate, opt-in tree for agents that install the server, authored with `add-skill`. Maintenance never creates or modifies it. This server publishes `skills/switzerland-parliament-guide/SKILL.md`: identifier routes (a Bulletin passage `voteId` is the roll call's `registrationNumber`, not a `chparl_get_votes` `voteId`), roll-call selection, and the gates before reporting votes, speakers, and committee membership. It ships through npm `files`, plugins, MCPB, and the Docker image, and `createApp({ skills: 'skills' })` serves it as `skill://switzerland-parliament-guide/SKILL.md`. A tool or behavior change that touches a claim in it updates the skill in the same change and re-verifies that claim live.
 
 **Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
@@ -234,7 +239,7 @@ Available skills:
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. Every excluded root path needs a root-anchored `.mcpbignore` line; root `skills/` is never excluded. After packing, `scripts/clean-mcpb.ts` prunes dev dependencies, dependency-shipped agent docs, platform-specific native bindings, node-gyp generator/intermediate files that expose packing-machine paths (compiled `*.node` addons stay), and build-only framework and better-sqlite3 files. `lint:packaging` checks the exclusions and packed content. MCPB uses Node and stdio; Streamable HTTP runs separately. This keyless server needs no bundle user configuration.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. Every excluded root path needs a root-anchored `.mcpbignore` line; root `skills/` is never excluded. After packing, `scripts/clean-mcpb.ts` prunes dev dependencies, dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere; a `skills/` deeper in a package is runtime code and stays), platform-specific native bindings, node-gyp generator/intermediate files that expose packing-machine paths (compiled `*.node` addons stay), and build-only framework and better-sqlite3 files. `lint:packaging` checks the exclusions and packed content. MCPB uses Node and stdio; Streamable HTTP runs separately. This keyless server needs no bundle user configuration.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 

@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/switzerland-parliament-mcp-server</h1>
   <p><b>Search Swiss parliamentary business, votes, debates, members, and declared interests via MCP. STDIO or Streamable HTTP.</b>
-  <div>7 Tools • 0 Resources • 0 Prompts</div>
+  <div>7 Tools • 0 Resources • 0 Prompts • 1 Skill</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/switzerland-parliament-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/switzerland-parliament-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/switzerland-parliament-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/switzerland-parliament-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/switzerland-parliament-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/switzerland-parliament-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -31,6 +31,8 @@
 
 Swiss Federal Assembly records from Curia Vista and the Amtliches Bulletin. Find parliamentary business, read its original texts and procedural history, follow the debate in either council, inspect Nationalrat roll calls, and look up members and declared interests. Uses the [public OData service](https://ws.parlament.ch/odata.svc/) without an API key; runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
 
+Ships the `switzerland-parliament-guide` agent skill (`skill://switzerland-parliament-guide/SKILL.md`), which plugin installs and MCP clients read for the checks that span tools: choosing which roll call to report, tracing a Bulletin vote announcement to its roll call, what the Ständerat record holds, and committee rosters that show only the current composition.
+
 Results credit **Parlamentsdienste der Bundesversammlung, Bern**, with source URLs and download dates. This is an unofficial reproduction. The [Parliament's open-data conditions](https://www.parlament.ch/de/%C3%BCber-das-parlament/fakten-und-zahlen/open-data-web-services) apply to source content; underlying author rights remain intact.
 
 ### Tools
@@ -41,7 +43,7 @@ Results credit **Parlamentsdienste der Bundesversammlung, Bern**, with source UR
 | `chparl_get_business` | Read business metadata, original texts, status history, bills, related business, committee consultations, or debate subjects |
 | `chparl_get_votes` | Find Nationalrat roll calls, page member decisions, or read complete vote and parliamentary-group counts |
 | `chparl_search_transcripts` | Find debate passages by business, subject, speaker, session, council, or dates; retrieve original text |
-| `chparl_search_members` | Find current or former parliamentary affiliation records by name, council, canton, party, or group |
+| `chparl_search_members` | Find current or former parliamentary affiliation records by name, council, canton, party, or group, or list a committee's current members |
 | `chparl_get_member` | Read parliamentary identity, council terms, committee memberships, or declared interests |
 | `chparl_list_reference` | Resolve identifiers, coverage, languages, codes, committees, and sessions |
 
@@ -49,7 +51,7 @@ Results credit **Parlamentsdienste der Bundesversammlung, Bern**, with source UR
 
 ### `chparl_search_business` <sub>tool</sub>
 
-- `query` (title substring), `author` (published submitter label, not every co-signatory), `typeId`, `statusId`, `sessionId` (submission session), `committeeId`, and inclusive `submittedFrom` / `submittedTo`. Newest business IDs first, default 20/max 100
+- `query` (title substring), `author` (published submitter label, not every co-signatory), `typeId`, `statusId`, `sessionId` (submission session), `committeeId`, and inclusive `submittedFrom` / `submittedTo`. Newest business IDs first, default 20/max 100. Text too long for the source's 2,048-byte URL-encoded query string fails as `request_too_long` instead of being sent
 - Continue with `nextCursor` and unchanged filters; a cursor from other filters fails as `invalid_cursor`. `totalCount` is reported only without author or committee filters. Author searches use an extra matching row to establish continuation; committee searches page role candidates, so pages can be short
 
 ---
@@ -73,16 +75,18 @@ Results credit **Parlamentsdienste der Bundesversammlung, Bern**, with source UR
 
 ### `chparl_search_transcripts` <sub>tool</sub>
 
-- Both councils from the **1999 winter session**. Scope with `businessId` or `subjectId` (exclusive), `personNumber`, `sessionId`, or a date bound; `council` only narrows. `query` (original-text substring) also needs `sessionId` or a closed range of at most **31 calendar days**
+- Both councils from the **1999 winter session**. Scope with `businessId` or `subjectId` (exclusive), `personNumber`, `sessionId`, or a date bound; `council` only narrows. `query` (original-text substring) also needs `sessionId` or a closed range of at most **31 calendar days**, and text too long for the source's 2,048-byte URL-encoded query string fails as `request_too_long`
 - Metadata with `textSizeBytes` by default (20/max 100); `includeText: true` returns whole passages (3/max 10); an exact `transcriptId` defaults to full text. Continue with `nextOffset`
 - A business search covers up to 20 debate subjects; more fails as `business_scope_too_broad`, so page `chparl_get_business` section `subjects` and pass one `subjectId`. `found` marks exact-ID misses, `scopeFound` a missing business
+- `subjectBusinesses` maps each delivered passage's `subjectId` to the businesses published for that debate subject, whose `businessId` feeds `chparl_get_business` and `chparl_get_votes`. A passage's own `businessId` comes only from vote announcements. When that lookup fails for any upstream reason or outlasts its 10-second bound, the field is omitted with a notice and the passages are unchanged
 
 ---
 
 ### `chparl_search_members` <sub>tool</sub>
 
-- `query` (first, last, or official name substring), `membership` (`current` default, `former`, `all`), `council` (`N`/`S` or the German, French, or Italian council name), `cantonId`, `partyId`, `groupId`. Default 20/max 100, `nextOffset`
+- `query` (first, last, or official name substring), `membership` (`current` default, `former`, `all`), `council` (`N`/`S` or the German, French, or Italian council name), `cantonId`, `partyId`, `groupId`, `committeeId`. Default 20/max 100, `nextOffset`. `query` too long for the source's 2,048-byte URL-encoded query string fails as `request_too_long`
 - Rows are **MemberCouncil affiliation records**, not deduplicated people. Their `personNumber`, which need not equal `Person.ID`, feeds `chparl_get_member`, `chparl_get_votes`, and `chparl_search_transcripts`
+- `committeeId` (a `chparl_list_reference` topic `committees` id) lists that committee's current members: one row per membership, with `committeeFunctionId`/`committeeFunctionName`, and `totalCount` counting memberships. The other filters narrow the roster; a sub-committee has its own number and roster. Rosters are current composition only, so `membership` `former` or `all` fails as `incompatible_fields`. `committeeFound: false` with `guidance` marks an unknown committee; a committee with no published members returns `committeeFound: true` and an empty roster
 
 ---
 
@@ -166,7 +170,7 @@ See [`.env.example`](./.env.example) for the common framework overrides.
 
 ### Local development
 
-Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+Requires [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 
 ```sh
 git clone https://github.com/cyanheads/switzerland-parliament-mcp-server.git
@@ -205,7 +209,8 @@ The image defaults to HTTP transport, stateless sessions, and logs to `/var/log/
 
 | Directory | Purpose |
 |:---|:---|
-| `src/index.ts` | `createApp()` entry point and service setup; seven tools, no resources or prompts. |
+| `skills/` | The published `switzerland-parliament-guide` agent skill, served over MCP and shipped in the package, the `.mcpb` bundle, and the Docker image. |
+| `src/index.ts` | `createApp()` entry point and service setup; seven tools and the published skill, no domain resources or prompts. |
 | `src/mcp-server/tools` | Tool definitions, shared lossless rendering, and whole-record page fitting. |
 | `src/services/parliament` | OData client, workflow deadlines, domain schemas and services, provenance, and reference snapshots. |
 | `tests/` | Unit and integration tests, mirroring the `src/` structure. |

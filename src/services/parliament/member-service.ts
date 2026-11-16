@@ -5,7 +5,7 @@
 
 import { z } from '@cyanheads/mcp-ts-core';
 import { serializationError } from '@cyanheads/mcp-ts-core/errors';
-import type { MemberSearchFilters, MemberSummary } from './member-model.js';
+import type { MemberSearchFilters, MemberSearchRow, MemberSummary } from './member-model.js';
 import {
   type Language,
   odataInt32,
@@ -94,7 +94,43 @@ const RawInterestSchema = z.object({
   SortOrder: RawInt32,
   Modified: RawDate,
 });
+/** One MemberCommittee membership with its singular, non-optional MemberCouncil expansion. */
+const RawRosterSchema = z.object({
+  ID: z.uuid(),
+  Language: RawLanguage,
+  CommitteeFunction: RawInt32,
+  CommitteeFunctionName: RawText,
+  MembersCouncil: RawMemberSchema,
+});
 const affiliationSelect = Object.keys(RawAffiliationSchema.shape);
+const memberSelect = ['ID', ...affiliationSelect];
+
+/** A member-search page; committee searches also report whether the committee exists. */
+export interface MemberSearchPage extends ODataPage<MemberSearchRow> {
+  readonly committeeFound?: boolean;
+}
+
+/** Name, council, canton, party, and group predicates over MemberCouncil fields reached through `path`. */
+function narrowingPredicates(filters: MemberSearchFilters, path: '' | 'MembersCouncil/'): string[] {
+  const predicates: string[] = [];
+  if (filters.query !== undefined) {
+    const query = odataString(filters.query);
+    predicates.push(
+      `(substringof(${query},${path}FirstName) or substringof(${query},${path}LastName) or substringof(${query},${path}OfficialName))`,
+    );
+  }
+  if (filters.council) predicates.push(`${path}Council eq ${filters.council === 'N' ? 1 : 2}`);
+  if (filters.cantonId) predicates.push(`${path}Canton eq ${odataInt32(filters.cantonId)}`);
+  if (filters.partyId) predicates.push(`${path}Party eq ${odataInt32(filters.partyId)}`);
+  if (filters.groupId) predicates.push(`${path}ParlGroupNumber eq ${odataInt32(filters.groupId)}`);
+  return predicates;
+}
+
+const searchOrder = [
+  { field: 'LastName', direction: 'asc' },
+  { field: 'FirstName', direction: 'asc' },
+  { field: 'ID', direction: 'asc' },
+] as const;
 
 function sourceUrl(entity: ParliamentEntity, id: number | string, language: Language): string {
   return odataEntityUrl(entity, typeof id === 'number' ? String(id) : `guid'${id}'`, language);
@@ -145,34 +181,27 @@ function member(raw: z.infer<typeof RawMemberSchema>, language: Language): Membe
 export class MemberService {
   readonly #client = new ODataClient();
 
-  /** Search affiliation records, preserving the current/former/all distinction upstream. */
+  /**
+   * Search affiliation records, preserving the current/former/all distinction upstream. With a
+   * committeeId, page that committee's current MemberCommittee memberships instead; the caller
+   * rejects membership former/all, which this source cannot answer.
+   */
   async searchMembers(
     filters: MemberSearchFilters,
     workflow: WorkflowContext,
-  ): Promise<ODataPage<MemberSummary>> {
-    const predicates: string[] = [];
-    if (filters.membership !== 'all')
-      predicates.push(`Active eq ${filters.membership === 'current'}`);
-    if (filters.query !== undefined) {
-      const query = odataString(filters.query);
-      predicates.push(
-        `(substringof(${query},FirstName) or substringof(${query},LastName) or substringof(${query},OfficialName))`,
-      );
-    }
-    if (filters.council) predicates.push(`Council eq ${filters.council === 'N' ? 1 : 2}`);
-    if (filters.cantonId) predicates.push(`Canton eq ${odataInt32(filters.cantonId)}`);
-    if (filters.partyId) predicates.push(`Party eq ${odataInt32(filters.partyId)}`);
-    if (filters.groupId) predicates.push(`ParlGroupNumber eq ${odataInt32(filters.groupId)}`);
+  ): Promise<MemberSearchPage> {
+    if (filters.committeeId !== undefined)
+      return this.#committeeRoster(filters.committeeId, filters, workflow);
+    const predicates = [
+      ...(filters.membership === 'all' ? [] : [`Active eq ${filters.membership === 'current'}`]),
+      ...narrowingPredicates(filters, ''),
+    ];
     const page = await this.#client.collection(
       {
         entity: 'MemberCouncil',
         language: filters.language,
-        select: ['ID', ...affiliationSelect],
-        orderBy: [
-          { field: 'LastName', direction: 'asc' },
-          { field: 'FirstName', direction: 'asc' },
-          { field: 'ID', direction: 'asc' },
-        ],
+        select: memberSelect,
+        orderBy: searchOrder,
         ...(predicates.length > 0 && { filter: predicates.join(' and ') }),
       },
       RawMemberSchema,
@@ -180,6 +209,78 @@ export class MemberService {
       workflow,
     );
     return { ...page, items: page.items.map((raw) => member(raw, filters.language)) };
+  }
+
+  /** One membership per row, ordered by MemberCommittee's own names and membership GUID. */
+  async #committeeRoster(
+    committeeId: string,
+    filters: MemberSearchFilters,
+    workflow: WorkflowContext,
+  ): Promise<MemberSearchPage> {
+    const page = await this.#client.collection(
+      {
+        entity: 'MemberCommittee',
+        language: filters.language,
+        // CommitteeNumber leads, so every MembersCouncil/ navigation predicate stays scoped to one roster.
+        filter: [
+          `CommitteeNumber eq ${odataInt32(committeeId)}`,
+          ...narrowingPredicates(filters, 'MembersCouncil/'),
+        ].join(' and '),
+        expand: ['MembersCouncil'],
+        select: [
+          'ID',
+          'Language',
+          'CommitteeFunction',
+          'CommitteeFunctionName',
+          ...memberSelect.map((field) => `MembersCouncil/${field}`),
+        ],
+        orderBy: searchOrder,
+      },
+      RawRosterSchema,
+      filters,
+      workflow,
+    );
+    const items = page.items.map((raw): MemberSearchRow => {
+      verifyLanguage(raw, filters.language);
+      return {
+        ...member(raw.MembersCouncil, filters.language),
+        ...(raw.CommitteeFunction != null && { committeeFunctionId: raw.CommitteeFunction }),
+        ...(raw.CommitteeFunctionName != null && {
+          committeeFunctionName: raw.CommitteeFunctionName,
+        }),
+      };
+    });
+    // An empty roster and an unknown committee answer identically; only then read Committee.
+    const knownNonEmpty =
+      items.length > 0 || (page.totalCount !== undefined && page.totalCount > 0);
+    return {
+      ...page,
+      items,
+      committeeFound:
+        knownNonEmpty || (await this.#committeeExists(committeeId, filters.language, workflow)),
+    };
+  }
+
+  /** Read Committee by CommitteeNumber rather than assuming it equals Committee.ID. */
+  async #committeeExists(
+    committeeId: string,
+    language: Language,
+    workflow: WorkflowContext,
+  ): Promise<boolean> {
+    const page = await this.#client.collection(
+      {
+        entity: 'Committee',
+        language,
+        filter: `CommitteeNumber eq ${odataInt32(committeeId)}`,
+        select: ['ID'],
+        orderBy: [{ field: 'ID', direction: 'asc' }],
+        includeCount: false,
+      },
+      z.object({ ID: RawId }),
+      { limit: 1, offset: 0 },
+      workflow,
+    );
+    return page.items.length > 0;
   }
 
   /** Resolve Person by PersonNumber rather than assuming it equals Person.ID. */
@@ -230,7 +331,7 @@ export class MemberService {
           entity: 'MemberCouncil',
           language,
           filter: `PersonNumber eq ${odataInt32(personNumber)}`,
-          select: ['ID', ...affiliationSelect],
+          select: memberSelect,
           orderBy: [{ field: 'ID', direction: 'asc' }],
         },
         RawMemberSchema,

@@ -14,6 +14,10 @@ describe('businessTextReferences', () => {
     ['https://example.test/&#xD800;', 'https://example.test/%EF%BF%BD'],
     ['https://example.test/&#0;', 'https://example.test/%EF%BF%BD'],
     ['https://example.test/&#x110000;', 'https://example.test/%EF%BF%BD'],
+    ['https://example.test/?a=1&amp;b=2', 'https://example.test/?a=1&b=2'],
+    // Attribute mode leaves an unterminated legacy reference before `=` or an alphanumeric as text.
+    ['https://example.test/?a=1&para=2', 'https://example.test/?a=1&para=2'],
+    ['https://example.test/?q=&notit;', 'https://example.test/?q=&notit;'],
   ])('decodes HTML attribute %s while retaining the literal source', (originalUrl, url) => {
     expect(businessTextReferences(`<a href="${originalUrl}">link</a>`)).toEqual([
       { kind: 'link', originalUrl, url },

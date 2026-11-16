@@ -789,6 +789,79 @@ describe('chparl_search_business', () => {
     },
   );
 
+  it('refuses query text that makes the source request too long, with recovery on both surfaces', async () => {
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) =>
+        new URL(request.url).search.length - 1 > 2048
+          ? new Response('<!DOCTYPE html><html><title>404 - File or directory not found.</title>', {
+              status: 404,
+              headers: { 'Content-Type': 'text/html' },
+            })
+          : Response.json({ d: { results: [], __count: '0' } }),
+    });
+    const result = await runToolContract(searchBusinessTool, { query: 'é'.repeat(400) });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringContaining('the service accepts at most 2048'),
+        data: {
+          reason: 'request_too_long',
+          recovery: { hint: 'Shorten the text filters and retry this tool.' },
+        },
+      },
+    });
+    const text = textContent(result);
+    expect(text).toContain('request_too_long');
+    expect(text).toContain('the service accepts at most 2048');
+    expect(text).toContain('Shorten the text filters and retry this tool.');
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it('keeps 50-ID hydration batches of maximum-width business IDs within the source limit', async () => {
+    const ids = Array.from({ length: 100 }, (_, index) => 2_147_483_647 - index);
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) => {
+        const url = new URL(request.url);
+        const filter = url.searchParams.get('$filter') ?? '';
+        if (url.pathname === '/odata.svc/Business') {
+          const selected = [...filter.matchAll(/ID eq (\d+)/g)].map((match) => Number(match[1]));
+          return Response.json({
+            d: {
+              results: selected.map((ID) => ({ ID, Language: 'DE' })),
+              __count: String(selected.length),
+            },
+          });
+        }
+        return Response.json({
+          d: {
+            results: filter.includes('BusinessNumber lt')
+              ? []
+              : ids.map((BusinessNumber, index) => ({
+                  ID: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+                  Language: 'DE',
+                  BusinessNumber,
+                })),
+            __count: filter.includes('BusinessNumber lt') ? '0' : '100',
+          },
+        });
+      },
+    });
+    const result = await runToolContract(searchBusinessTool, { committeeId: '7', limit: 100 });
+    expect(result.isError).not.toBe(true);
+    const hydration = http.calls
+      .map(({ request }) => new URL(request.url))
+      .filter((url) => url.pathname === '/odata.svc/Business');
+    expect(
+      hydration.map((url) => (url.searchParams.get('$filter')?.match(/ID eq /g) ?? []).length),
+    ).toEqual([50, 50]);
+    for (const url of hydration) expect(url.search.length - 1).toBeLessThanOrEqual(2048);
+  });
+
   it.each([
     { Language: 'FR' },
     { ID: 'invalid-role-id' },

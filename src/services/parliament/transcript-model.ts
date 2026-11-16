@@ -129,12 +129,14 @@ export const TranscriptSchema = z
     voteId: z
       .string()
       .optional()
-      .describe('Original VoteId string when the passage announces a vote.'),
+      .describe(
+        'Original VoteId string when the passage announces a vote; it equals the roll call registrationNumber in chparl_get_votes votes mode, not its voteId.',
+      ),
     businessId: z
       .string()
       .optional()
       .describe(
-        'Published VoteBusinessNumber; not an exhaustive passage-to-business relationship.',
+        "Published VoteBusinessNumber of a vote announcement; the debate's businesses are in subjectBusinesses, joined on subjectId.",
       ),
     businessShortNumber: z.string().optional().describe('Original VoteBusinessShortNumber.'),
     textSizeBytes: z
@@ -204,6 +206,32 @@ export function normalizeTranscript(
     }),
   };
 }
+
+/** One published SubjectBusiness row: a business a debate subject is scheduled under. */
+const SubjectBusinessSchema = z
+  .object({
+    businessId: z
+      .string()
+      .describe(
+        'Canonical eight-digit BusinessNumber; pass it to chparl_get_business or chparl_get_votes.',
+      ),
+    shortNumber: z.string().optional().describe('Published BusinessShortNumber, unchanged.'),
+    title: z.string().optional().describe('Published business title in the metadata language.'),
+  })
+  .describe('One business published for a debate subject.');
+
+/** A delivered debate subject and every business published for it. */
+export const SubjectBusinessesSchema = z
+  .object({
+    subjectId: z.string().describe('Debate IdSubject carried by at least one delivered passage.'),
+    businesses: z
+      .array(SubjectBusinessSchema)
+      .describe('Published SubjectBusiness rows in SortOrder order; empty when there are none.'),
+  })
+  .describe('One delivered debate subject with its published businesses.');
+
+/** One delivered subject's businesses, in SortOrder order. */
+export type SubjectBusinesses = z.infer<typeof SubjectBusinessesSchema>;
 
 /** Normalized filters echoed identically for exact lookup and scoped searches. */
 export const TranscriptFiltersSchema = z

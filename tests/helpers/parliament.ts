@@ -33,6 +33,13 @@ export function textContent(result: {
     .join('\n');
 }
 
+/** UTF-8 bytes of both public surfaces of a tool result, measured independently of the server's fitting. */
+export function resultBytes(result: { structuredContent?: unknown; content: unknown }): number {
+  return new TextEncoder().encode(
+    JSON.stringify({ structuredContent: result.structuredContent, content: result.content }),
+  ).byteLength;
+}
+
 /** Decode CommonMark text, JSON string fences, and usable link/image destinations independently. */
 export function decodeParliamentMarkdown(markdown: string) {
   const tokens = new MarkdownIt('commonmark').parse(markdown, {});

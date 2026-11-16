@@ -13,8 +13,12 @@ import {
   normalizeBusiness,
 } from '@/services/parliament/business-model.js';
 import {
-  BusinessSectionItemSchema,
+  BillRowSchema,
   listBusinessSection,
+  PreconsultationRowSchema,
+  RelatedBusinessRowSchema,
+  StatusHistoryRowSchema,
+  SubjectRowSchema,
 } from '@/services/parliament/business-relations.js';
 import { businessOverview, resolveBusiness } from '@/services/parliament/business-service.js';
 import {
@@ -150,23 +154,23 @@ export const getBusinessTool = tool('chparl_get_business', {
       'Original selected texts or automatic field outline.',
     ),
     statusHistory: z
-      .array(BusinessSectionItemSchema)
+      .array(StatusHistoryRowSchema)
       .optional()
       .describe('Published status history page.'),
     bills: z
-      .array(BusinessSectionItemSchema)
+      .array(BillRowSchema)
       .optional()
       .describe('Linked bill page; no enacted-law content is inferred.'),
     relatedBusiness: z
-      .array(BusinessSectionItemSchema)
+      .array(RelatedBusinessRowSchema)
       .optional()
       .describe('Related business page.'),
     preconsultations: z
-      .array(BusinessSectionItemSchema)
+      .array(PreconsultationRowSchema)
       .optional()
       .describe('Published committee preconsultation page.'),
     subjects: z
-      .array(BusinessSectionItemSchema)
+      .array(SubjectRowSchema)
       .optional()
       .describe('Debate subjects usable in chparl_search_transcripts.'),
     provenance: ProvenanceSchema,

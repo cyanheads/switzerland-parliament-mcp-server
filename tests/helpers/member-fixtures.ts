@@ -76,6 +76,21 @@ export function committeeRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** Synthetic MemberCommittee membership with its expanded, active MemberCouncil record. */
+export function rosterRow(
+  overrides: Record<string, unknown> = {},
+  memberOverrides: Record<string, unknown> = {},
+) {
+  return {
+    ID: memberGuid(1),
+    Language: 'DE',
+    CommitteeFunction: 1,
+    CommitteeFunctionName: 'Mitglied',
+    MembersCouncil: memberRow({ Active: true, Council: 1, DateLeaving: null, ...memberOverrides }),
+    ...overrides,
+  };
+}
+
 /** Complete synthetic declaration with a published false paid flag. */
 export function interestRow(overrides: Record<string, unknown> = {}) {
   return {

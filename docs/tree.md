@@ -1,6 +1,6 @@
 # switzerland-parliament-mcp-server - Directory Structure
 
-Generated on: 2026-10-26 03:18:18
+Generated on: 2026-11-16 01:02:36
 
 ```text
 switzerland-parliament-mcp-server/
@@ -135,6 +135,9 @@ switzerland-parliament-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── switzerland-parliament-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── mcp-server/
 │   │   ├── prompts/
@@ -218,6 +221,7 @@ switzerland-parliament-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile

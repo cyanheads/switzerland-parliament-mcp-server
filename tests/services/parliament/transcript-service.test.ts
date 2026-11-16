@@ -3,16 +3,28 @@
  * @module tests/services/parliament/transcript-service.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, describe, expect, it } from 'vitest';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { searchTranscriptsTool } from '@/mcp-server/tools/definitions/search-transcripts.tool.js';
+import type { Source } from '@/services/parliament/provenance.js';
+import { resolveSubjectBusinesses } from '@/services/parliament/transcript-service.js';
+import { withWorkflow } from '@/services/parliament/workflow.js';
 import { parliamentHttp, textContent } from '../../helpers/parliament.js';
-import { transcriptId, transcriptRow } from '../../helpers/transcript-fixtures.js';
+import {
+  marriageSubjectBusiness,
+  requestedSubjects,
+  subjectBusinessPage,
+  transcriptId,
+  transcriptRow,
+} from '../../helpers/transcript-fixtures.js';
 import { expectVoteParity } from '../../helpers/vote-fixtures.js';
 
 let http: ReturnType<typeof parliamentHttp> | undefined;
-afterEach(() => http?.restore());
+afterEach(() => {
+  http?.restore();
+  vi.useRealTimers();
+});
 
 function subjectsFixture(count: number, withCount: boolean, sourcePageSize = 20) {
   const subjects = Array.from({ length: count }, (_, i) => ({
@@ -30,6 +42,11 @@ function subjectsFixture(count: number, withCount: boolean, sourcePageSize = 20)
           Transcripts: { results: [{ ID: '1', Language: 'DE', Text: 'Only a vote announcement' }] },
         },
       });
+    if (url.pathname === '/odata.svc/SubjectBusiness' && requestedSubjects(url).length > 0)
+      return subjectBusinessPage(
+        url,
+        subjects.map((subject) => ({ ...subject, SortOrder: 1, Title: 'Synthetic business' })),
+      );
     if (url.pathname === '/odata.svc/SubjectBusiness') {
       const offset = Number(url.searchParams.get('$skip'));
       const top = Math.min(sourcePageSize, Number(url.searchParams.get('$top')));
@@ -84,34 +101,54 @@ describe('transcript relationship service', () => {
       '/odata.svc/SubjectBusiness',
       '/odata.svc/SubjectBusiness',
       '/odata.svc/Transcript',
+      '/odata.svc/SubjectBusiness',
     ]);
     expect(urls[1]?.searchParams.get('$filter')).toBe(
       "Language eq 'DE' and (BusinessNumber eq 20991234)",
     );
+    const subjectPredicates = subjects.map((row) => `IdSubject eq ${row.IdSubject}L`).join(' or ');
     expect(urls[4]?.searchParams.get('$filter')).toBe(
-      `Language eq 'DE' and ((${subjects.map((row) => `IdSubject eq ${row.IdSubject}L`).join(' or ')}))`,
+      `Language eq 'DE' and ((${subjectPredicates}))`,
+    );
+    // A business-scoped page still resolves every subject: a subject can carry other businesses.
+    expect(urls[5]?.searchParams.get('$filter')).toBe(
+      `Language eq 'DE' and (${subjectPredicates})`,
     );
     expect(
       searchTranscriptsTool.output.parse(result.structuredContent).provenance.sources,
-    ).toHaveLength(5);
+    ).toHaveLength(6);
     expectVoteParity(result);
   });
 
   it.each([true, false])(
     'accepts exactly 20 subjects with count=$0, probing a count-free full-page boundary',
     async (withCount) => {
-      subjectsFixture(20, withCount);
+      const subjects = subjectsFixture(20, withCount);
       const result = await runToolContract(searchTranscriptsTool, { businessId: '20991234' });
       expect(result.isError).not.toBe(true);
+      // Byte fitting may deliver fewer than 20; the passage query still covers all 20 subjects.
+      const delivered = searchTranscriptsTool.output.parse(result.structuredContent).transcripts
+        .length;
+      expect(delivered).toBeGreaterThan(0);
       expect(result.structuredContent).toMatchObject({
         scopeFound: true,
-        returnedCount: 20,
+        returnedCount: delivered,
         totalCount: 20,
+        hasMore: delivered < 20,
       });
+      const passageQuery = http?.calls
+        .map((call) => new URL(call.request.url))
+        .find((url) => url.pathname === '/odata.svc/Transcript');
+      expect(passageQuery?.searchParams.get('$filter')).toBe(
+        `Language eq 'DE' and ((${subjects.map((row) => `IdSubject eq ${row.IdSubject}L`).join(' or ')}))`,
+      );
       const calls =
         http?.calls
           .map((call) => new URL(call.request.url))
-          .filter((url) => url.pathname === '/odata.svc/SubjectBusiness') ?? [];
+          .filter(
+            (url) =>
+              url.pathname === '/odata.svc/SubjectBusiness' && requestedSubjects(url).length === 0,
+          ) ?? [];
       expect(calls).toHaveLength(withCount ? 1 : 2);
       if (!withCount) {
         expect(calls[1]?.searchParams.get('$skip')).toBe('20');
@@ -224,5 +261,451 @@ describe('transcript relationship service', () => {
       error: { code: JsonRpcErrorCode.SerializationError },
     });
     expect(http.calls).toHaveLength(2);
+  });
+});
+
+/** Resolve inside a real workflow; `before` runs inside it, ahead of the lookup. */
+function lookup(ids: string[], options: { signal?: AbortSignal; before?: () => void } = {}) {
+  return withWorkflow(
+    createMockContext(options.signal ? { signal: options.signal } : {}),
+    async (workflow) => {
+      options.before?.();
+      const result = await resolveSubjectBusinesses(ids, 'de', workflow);
+      return { result, sources: workflow.sources.map((source) => source.url) };
+    },
+  );
+}
+
+/** A lookup request that settles only when its signal aborts. */
+function hang(request: Request): Promise<Response> {
+  return new Promise((_resolve, reject) =>
+    request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true }),
+  );
+}
+
+function lookupCalls(): URL[] {
+  return http?.calls.map((call) => new URL(call.request.url)) ?? [];
+}
+
+const useLookupClock = () =>
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+
+describe('subject business lookup', () => {
+  it('sends nothing for a page without debate subjects', async () => {
+    http = parliamentHttp(() => {
+      throw new Error('Unexpected request.');
+    });
+    await expect(lookup([])).resolves.toEqual({
+      result: { status: 'resolved', entries: [] },
+      sources: [],
+    });
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it('batches 100 subjects into two language-scoped lookups of 50 in first-appearance order', async () => {
+    const ids = Array.from({ length: 100 }, (_, i) => String(200_000 - i));
+    const mappings = [
+      { IdSubject: ids[0], BusinessNumber: 20_010_002, Language: 'DE', SortOrder: 2, Title: 'B' },
+      { IdSubject: ids[0], BusinessNumber: 20_010_001, Language: 'DE', SortOrder: 1, Title: 'A' },
+      { IdSubject: ids[1], BusinessNumber: 20_010_003, Language: 'DE', SortOrder: 1, Title: null },
+      {
+        IdSubject: ids[99],
+        BusinessNumber: 20_010_004,
+        Language: 'DE',
+        SortOrder: 1,
+        BusinessShortNumber: '01.0004',
+      },
+    ];
+    http = parliamentHttp((request) => subjectBusinessPage(new URL(request.url), mappings));
+    const { result, sources } = await lookup(ids);
+    if (result.status !== 'resolved') throw new Error('Expected a resolved lookup.');
+    expect(result.entries.map((entry) => entry.subjectId)).toEqual(ids);
+    expect(result.entries[0]?.businesses).toEqual([
+      { businessId: '20010001', title: 'A' },
+      { businessId: '20010002', title: 'B' },
+    ]);
+    expect(result.entries[1]?.businesses).toEqual([{ businessId: '20010003' }]);
+    expect(result.entries[2]?.businesses).toEqual([]);
+    expect(result.entries[99]?.businesses).toEqual([
+      { businessId: '20010004', shortNumber: '01.0004' },
+    ]);
+    const urls = lookupCalls();
+    expect(urls.map(requestedSubjects)).toEqual([ids.slice(0, 50), ids.slice(50)]);
+    expect(urls[0]?.searchParams.get('$filter')).toMatch(
+      /^Language eq 'DE' and \(IdSubject eq 200000L or IdSubject eq 199999L or /,
+    );
+    expect(urls[0]?.searchParams.get('$select')).toBe(
+      'IdSubject,BusinessNumber,Language,BusinessShortNumber,Title,SortOrder',
+    );
+    expect(urls[0]?.searchParams.get('$orderby')).toBe(
+      'IdSubject asc,SortOrder asc,BusinessNumber asc',
+    );
+    for (const url of urls) expect(url.search.length - 1).toBeLessThanOrEqual(2048);
+    expect(sources).toEqual(http.calls.map((call) => call.request.url));
+  });
+
+  it('sizes batches by encoded bytes so maximum-width subject IDs never overrun the source limit', async () => {
+    const ids = Array.from({ length: 100 }, (_, i) =>
+      String(9_223_372_036_854_775_807n - BigInt(i)),
+    );
+    const mappings = [
+      ...ids.slice(0, 48).flatMap((id, i) =>
+        Array.from({ length: 21 }, (_, order) => ({
+          IdSubject: id,
+          BusinessNumber: 20_000_000 + i * 100 + order,
+          Language: 'DE',
+          SortOrder: order + 1,
+        })),
+      ),
+      { ...marriageSubjectBusiness, IdSubject: ids[99] },
+    ];
+    http = parliamentHttp((request) => {
+      const url = new URL(request.url);
+      return url.search.length - 1 > 2048
+        ? new Response('<html>404 - File or directory not found.</html>', {
+            status: 404,
+            headers: { 'Content-Type': 'text/html' },
+          })
+        : subjectBusinessPage(url, mappings);
+    });
+    const { result } = await lookup(ids);
+    if (result.status !== 'resolved') throw new Error('Expected a resolved lookup.');
+    expect(result.entries.map((entry) => entry.subjectId)).toEqual(ids);
+    expect(result.entries[0]?.businesses).toHaveLength(21);
+    expect(result.entries[99]?.businesses).toEqual([
+      { businessId: '20130468', shortNumber: '13.468', title: 'Ehe für alle' },
+    ]);
+    const urls = lookupCalls();
+    expect(
+      urls.map((url) => [requestedSubjects(url).length, url.searchParams.get('$skip')]),
+    ).toEqual([
+      [48, '0'],
+      [48, '1000'],
+      [48, '0'],
+      [4, '0'],
+    ]);
+    for (const url of urls) expect(url.search.length - 1).toBeLessThanOrEqual(2048);
+  });
+
+  it('sizes a batch so its later source pages fit too, not only its first', async () => {
+    // 48 maximum-width IDs plus '10' fit at $skip=0 (2046 bytes) but not at $skip=1000 (2049).
+    const ids = [
+      ...Array.from({ length: 48 }, (_, i) => String(9_223_372_036_854_775_807n - BigInt(i))),
+      '10',
+    ];
+    const mappings = ids.slice(0, 48).flatMap((id, i) =>
+      Array.from({ length: 21 }, (_, order) => ({
+        IdSubject: id,
+        BusinessNumber: 20_000_000 + i * 100 + order,
+        Language: 'DE',
+        SortOrder: order + 1,
+      })),
+    );
+    http = parliamentHttp((request) => subjectBusinessPage(new URL(request.url), mappings));
+    const { result } = await lookup(ids);
+    expect(result.status).toBe('resolved');
+    const urls = lookupCalls();
+    expect(
+      urls.map((url) => [requestedSubjects(url).length, url.searchParams.get('$skip')]),
+    ).toEqual([
+      [48, '0'],
+      [48, '1000'],
+      [1, '0'],
+    ]);
+    for (const url of urls) expect(url.search.length - 1).toBeLessThanOrEqual(2048);
+  });
+
+  it('drains every mapping of a batch beyond one 1000-row source page', async () => {
+    const ids = Array.from({ length: 50 }, (_, i) => String(300_000 + i));
+    const mappings = ids.flatMap((id, i) =>
+      Array.from({ length: 21 }, (_, order) => ({
+        IdSubject: id,
+        BusinessNumber: 20_000_000 + i * 100 + order,
+        Language: 'DE',
+        SortOrder: order + 1,
+      })),
+    );
+    http = parliamentHttp((request) => subjectBusinessPage(new URL(request.url), mappings));
+    const { result } = await lookup(ids);
+    if (result.status !== 'resolved') throw new Error('Expected a resolved lookup.');
+    expect(result.entries.map((entry) => entry.businesses.length)).toEqual(ids.map(() => 21));
+    expect(result.entries[49]?.businesses.at(-1)).toEqual({ businessId: '20004920' });
+    expect(lookupCalls().map((url) => url.searchParams.get('$skip'))).toEqual(['0', '1000']);
+  });
+
+  it('recovers with its one retry inside the bound', async () => {
+    useLookupClock();
+    http = parliamentHttp((request) =>
+      http?.calls.length === 1
+        ? new Response('', { status: 503 })
+        : subjectBusinessPage(new URL(request.url), [marriageSubjectBusiness]),
+    );
+    const pending = lookup(['50854']);
+    await vi.advanceTimersByTimeAsync(2_500);
+    const { result, sources } = await pending;
+    expect(result).toEqual({
+      status: 'resolved',
+      entries: [
+        {
+          subjectId: '50854',
+          businesses: [{ businessId: '20130468', shortNumber: '13.468', title: 'Ehe für alle' }],
+        },
+      ],
+    });
+    expect(http.calls).toHaveLength(2);
+    expect(sources).toHaveLength(1);
+  });
+
+  it.each<{
+    name: string;
+    respond: () => Response;
+    reason: string;
+    requests: number;
+    /** Responses read whole before their rows were rejected; provenance keeps every one. */
+    recorded?: number;
+  }>([
+    {
+      name: 'HTTP 429 asking past the retry cap',
+      respond: () => new Response('', { status: 429, headers: { 'Retry-After': '999' } }),
+      reason: 'rate_limited',
+      requests: 1,
+    },
+    {
+      name: 'HTTP 429 twice',
+      respond: () => new Response('', { status: 429 }),
+      reason: 'rate_limited',
+      requests: 2,
+    },
+    {
+      name: 'HTTP 503 twice',
+      respond: () => new Response('', { status: 503 }),
+      reason: 'upstream_unavailable',
+      requests: 2,
+    },
+    {
+      name: 'an HTTP 502 gateway page',
+      respond: () => new Response('<html>Bad Gateway</html>', { status: 502 }),
+      reason: 'upstream_unavailable',
+      requests: 2,
+    },
+    ...[401, 403, 404, 422].map((status) => ({
+      name: `HTTP ${status}`,
+      respond: () => new Response('', { status }),
+      reason: 'upstream_unavailable',
+      requests: 1,
+    })),
+    {
+      name: 'HTTP 408 twice',
+      respond: () => new Response('', { status: 408 }),
+      reason: 'upstream_unavailable',
+      requests: 2,
+    },
+    {
+      name: 'an unreachable network',
+      respond: () => {
+        throw new TypeError('fetch failed');
+      },
+      reason: 'upstream_unavailable',
+      requests: 2,
+    },
+    {
+      name: 'a non-network fetch failure',
+      respond: () => {
+        throw new Error('Socket gave up');
+      },
+      reason: 'upstream_unavailable',
+      requests: 1,
+    },
+    {
+      name: 'a broken body stream',
+      respond: () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"d":'));
+              controller.error(new TypeError('connection reset'));
+            },
+          }),
+        ),
+      reason: 'upstream_unavailable',
+      requests: 2,
+    },
+    {
+      name: 'an HTML gateway page served with HTTP 200',
+      respond: () => new Response('<!doctype html><html>Gateway</html>'),
+      reason: 'upstream_unavailable',
+      requests: 2,
+    },
+    {
+      name: 'malformed JSON',
+      respond: () => new Response('{broken'),
+      reason: 'unexpected_response',
+      requests: 1,
+    },
+    {
+      name: 'a schema-failing row',
+      respond: () =>
+        Response.json({ d: { results: [{ ...marriageSubjectBusiness, SortOrder: 'first' }] } }),
+      reason: 'unexpected_response',
+      requests: 1,
+    },
+    {
+      name: 'a row in another language',
+      respond: () =>
+        Response.json({ d: { results: [{ ...marriageSubjectBusiness, Language: 'FR' }] } }),
+      reason: 'unexpected_response',
+      requests: 1,
+      recorded: 1,
+    },
+    {
+      name: 'a row for an unrequested subject',
+      respond: () =>
+        Response.json({ d: { results: [{ ...marriageSubjectBusiness, IdSubject: '50855' }] } }),
+      reason: 'unexpected_response',
+      requests: 1,
+      recorded: 1,
+    },
+    {
+      name: 'a duplicated row',
+      respond: () =>
+        Response.json({ d: { results: [marriageSubjectBusiness, marriageSubjectBusiness] } }),
+      reason: 'unexpected_response',
+      requests: 1,
+      recorded: 1,
+    },
+  ])('degrades on $name', async ({ respond, reason, requests, recorded = 0 }) => {
+    useLookupClock();
+    http = parliamentHttp(respond);
+    const pending = lookup(['50854']);
+    await vi.advanceTimersByTimeAsync(2_500);
+    const { result, sources } = await pending;
+    expect(result).toEqual({ status: 'unavailable', reason });
+    expect(sources).toEqual(http.calls.slice(0, recorded).map((call) => call.request.url));
+    expect(http.calls).toHaveLength(requests);
+  });
+
+  it('fails the call on a programmer error in its own code', async () => {
+    http = parliamentHttp((request) =>
+      subjectBusinessPage(new URL(request.url), [marriageSubjectBusiness]),
+    );
+    // Recording provenance on a frozen ledger throws a TypeError inside the client, not upstream.
+    const sources = Object.freeze<Source[]>([]) as Source[];
+    const failure = await withWorkflow(createMockContext(), (workflow) =>
+      resolveSubjectBusinesses(['50854'], 'de', { ...workflow, sources }),
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(TypeError);
+    expect(failure).not.toBeInstanceOf(McpError);
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('degrades when a request outlasts the 10-second bound', async () => {
+    useLookupClock();
+    http = parliamentHttp(hang);
+    let settled = false;
+    const pending = lookup(['50854']).finally(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toEqual({
+      result: { status: 'unavailable', reason: 'bound_expired' },
+      sources: [],
+    });
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('ends the bound one second before the workflow deadline', async () => {
+    useLookupClock();
+    http = parliamentHttp(hang);
+    let settled = false;
+    const pending = lookup(['50854'], { before: () => vi.advanceTimersByTime(36_000) }).finally(
+      () => {
+        settled = true;
+      },
+    );
+    await vi.advanceTimersByTimeAsync(7_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toMatchObject({
+      result: { status: 'unavailable', reason: 'bound_expired' },
+    });
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it.each([44_000, 44_500])(
+    'sends nothing when the lookup would start %i ms into the workflow',
+    async (elapsedMs) => {
+      useLookupClock();
+      http = parliamentHttp(() => {
+        throw new Error('Unexpected request.');
+      });
+      await expect(
+        lookup(['50854'], { before: () => vi.advanceTimersByTime(elapsedMs) }),
+      ).resolves.toEqual({
+        result: { status: 'unavailable', reason: 'bound_expired' },
+        sources: [],
+      });
+      expect(http.calls).toHaveLength(0);
+    },
+  );
+
+  it('fails on an expired workflow deadline instead of degrading', async () => {
+    useLookupClock();
+    http = parliamentHttp(() => {
+      throw new Error('Unexpected request.');
+    });
+    await expect(
+      lookup(['50854'], { before: () => vi.advanceTimersByTime(45_000) }),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'workflow_deadline_exceeded' },
+    });
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it('rejects an expired workflow deadline from the lookup itself, before the enclosing workflow checks', async () => {
+    useLookupClock();
+    http = parliamentHttp(() => {
+      throw new Error('Unexpected request.');
+    });
+    let outcome: { thrown?: unknown; returned?: unknown } = {};
+    await withWorkflow(createMockContext(), async (workflow) => {
+      vi.advanceTimersByTime(45_000);
+      outcome = await resolveSubjectBusinesses(['50854'], 'de', workflow).then(
+        (returned) => ({ returned }),
+        (thrown: unknown) => ({ thrown }),
+      );
+    }).catch(() => undefined);
+    expect(outcome).not.toHaveProperty('returned');
+    expect(outcome.thrown).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'workflow_deadline_exceeded' },
+    });
+  });
+
+  it('rethrows caller cancellation during a request', async () => {
+    const controller = new AbortController();
+    const reason = new DOMException('Stop the lookup.', 'AbortError');
+    http = parliamentHttp((request) => {
+      const settled = hang(request);
+      controller.abort(reason);
+      return settled;
+    });
+    await expect(lookup(['50854'], { signal: controller.signal })).rejects.toBe(reason);
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('rethrows caller cancellation during the retry backoff', async () => {
+    useLookupClock();
+    const controller = new AbortController();
+    const reason = new DOMException('Stop retrying the lookup.', 'AbortError');
+    http = parliamentHttp(() => new Response('', { status: 503 }));
+    const pending = lookup(['50854'], { signal: controller.signal });
+    const assertion = expect(pending).rejects.toBe(reason);
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort(reason);
+    await assertion;
+    expect(http.calls).toHaveLength(1);
   });
 });

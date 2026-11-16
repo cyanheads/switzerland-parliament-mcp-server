@@ -3,10 +3,13 @@
  * @module tests/mcp-server/tools/business-detail.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { getBusinessTool } from '@/mcp-server/tools/definitions/get-business.tool.js';
+import { listBusinessSection } from '@/services/parliament/business-relations.js';
+import { withWorkflow } from '@/services/parliament/workflow.js';
 import { businessRow, businessSummary, expectBusinessParity } from '../../helpers/business.js';
 import { parliamentHttp, textContent } from '../../helpers/parliament.js';
 
@@ -164,6 +167,52 @@ const relationCases = [
   },
 ] as const;
 
+/** A non-null value of its source type for every property a relationship query can select. */
+const selectableValues: Record<string, unknown> = {
+  ID: guid,
+  Language: 'DE',
+  BusinessNumber: 20991234,
+  BusinessStatusId: 1,
+  BusinessStatusName: 'S',
+  BusinessStatusDate: '/Date(0)/',
+  IsMotionInSecondCouncil: true,
+  NewKey: 1,
+  Modified: '/Date(1000)/',
+  BillNumber: 1,
+  BillType: 1,
+  BillTypeName: 'T',
+  Title: 'T',
+  BusinessStatus: 1,
+  BusinessStatusText: 'T',
+  SubmissionDate: '/Date(0)/',
+  RelatedBusinessNumber: 20991235,
+  RelatedBusinessShortNumber: '99.1235',
+  RelatedBusinessTitle: 'T',
+  RelatedBusinessType: 1,
+  RelatedBusinessTypeName: 'T',
+  RelatedBusinessTypeAbbreviation: 'T',
+  PriorityCode: 'A',
+  IdBill: guid,
+  CommitteeNumber: 1,
+  CommitteeName: 'C',
+  Abbreviation: 'A',
+  Abbreviation1: 'A1',
+  Abbreviation2: 'A2',
+  PreconsultationDate: '/Date(0)/',
+  TreatmentCategory: 'A',
+  IdSubject: '1',
+  SortOrder: 0,
+  PublishedNotes: 'N',
+};
+
+const AdvertisedRowsSchema = z.object({
+  items: z.object({
+    type: z.literal('object'),
+    properties: z.record(z.string(), z.unknown()),
+    additionalProperties: z.literal(false),
+  }),
+});
+
 describe('chparl_get_business', () => {
   it('discloses every overview field and byte availability without implicit relationships or large text', async () => {
     serveBusiness({
@@ -300,6 +349,99 @@ describe('chparl_get_business', () => {
       expectBusinessParity(result);
     },
   );
+
+  it.each(relationCases)(
+    'advertises exactly the $key row fields its section mapping can emit',
+    async ({ section, key, expected }) => {
+      // The source returns every property the section selects, so the mapping emits all it can.
+      http.reset();
+      http.route({
+        match: () => true,
+        respond: (request) => {
+          const select = new URL(request.url).searchParams.get('$select')?.split(',') ?? [];
+          const row = Object.fromEntries(
+            select.map((field) => {
+              if (!Object.hasOwn(selectableValues, field))
+                throw new Error(`No synthetic value for selected property ${field}.`);
+              return [field, selectableValues[field]];
+            }),
+          );
+          return Response.json({ d: { results: [row], __count: '1' } });
+        },
+      });
+      const page = await withWorkflow(createMockContext(), (workflow) =>
+        listBusinessSection('20991234', section, 'de', { limit: 1, offset: 0 }, workflow),
+      );
+      const emitted = Object.keys(page.items[0] ?? {}).sort();
+      expect(emitted).toEqual(Object.keys(expected).sort());
+      const advertised = AdvertisedRowsSchema.parse(
+        z.toJSONSchema(getBusinessTool.output, { io: 'output', target: 'draft-2020-12' })
+          .properties?.[key],
+      );
+      expect(Object.keys(advertised.items.properties).sort()).toEqual(emitted);
+    },
+  );
+
+  // A pick's key order is the order the output parse emits on both surfaces; 0.1.2 used the superset's.
+  it.each([
+    [
+      'statusHistory',
+      ['id', 'statusId', 'statusName', 'date', 'isMotionInSecondCouncil', 'newKey', 'modifiedAt'],
+    ],
+    [
+      'bills',
+      [
+        'id',
+        'statusId',
+        'modifiedAt',
+        'billNumber',
+        'billTypeId',
+        'billTypeName',
+        'title',
+        'statusText',
+        'statusDate',
+        'submissionDate',
+        'sourceUrl',
+      ],
+    ],
+    [
+      'relatedBusiness',
+      [
+        'id',
+        'modifiedAt',
+        'title',
+        'relatedBusinessId',
+        'shortNumber',
+        'typeId',
+        'typeName',
+        'typeAbbreviation',
+        'priorityCode',
+      ],
+    ],
+    [
+      'preconsultations',
+      [
+        'id',
+        'modifiedAt',
+        'billNumber',
+        'billId',
+        'committeeId',
+        'committeeName',
+        'committeeAbbreviation',
+        'committeeAbbreviation1',
+        'committeeAbbreviation2',
+        'preconsultationDate',
+        'treatmentCategory',
+      ],
+    ],
+    ['subjects', ['modifiedAt', 'title', 'subjectId', 'businessId', 'sortOrder', 'publishedNotes']],
+  ] as const)('keeps the 0.1.2 field order of %s rows', (key, order) => {
+    const advertised = AdvertisedRowsSchema.parse(
+      z.toJSONSchema(getBusinessTool.output, { io: 'output', target: 'draft-2020-12' })
+        .properties?.[key],
+    );
+    expect(Object.keys(advertised.items.properties)).toEqual(order);
+  });
 
   it.each([
     { total: '0', offset: 0, guidance: 'no published records' },
