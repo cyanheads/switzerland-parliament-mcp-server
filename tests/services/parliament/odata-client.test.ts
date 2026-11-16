@@ -4,7 +4,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, type McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildODataUrl, ODataClient, type ODataQuery } from '@/services/parliament/odata-client.js';
@@ -334,17 +334,141 @@ describe('OData request and complete pages', () => {
   });
 });
 
+describe('OData request length', () => {
+  /** The test query padded so its URL-encoded query string is exactly `bytes` long. */
+  function sizedQuery(bytes: number, character: 'a' | 'é', limit = 3, offset = 0): ODataQuery {
+    const padded = (text: string) => ({ ...query, filter: `substringof('${text}',SessionName)` });
+    const length = (text: string) => buildODataUrl(padded(text), limit, offset).search.length - 1;
+    const repeated = character.repeat(
+      Math.floor((bytes - length('')) / (length(character) - length(''))),
+    );
+    return padded(repeated + 'a'.repeat(bytes - length(repeated)));
+  }
+
+  /** The source answers an over-long query string with an IIS HTML page, never JSON. */
+  function respondLikeSource(body: unknown) {
+    respond((request) =>
+      new URL(request.url).search.length - 1 > 2048
+        ? new Response(
+            '<!DOCTYPE html><html><head><title>404 - File or directory not found.</title></head></html>',
+            { status: 404, headers: { 'Content-Type': 'text/html' } },
+          )
+        : Response.json(body),
+    );
+  }
+
+  it('dispatches a query string of exactly 2048 encoded bytes', async () => {
+    respondLikeSource({ d: { results: [{ ID: 1 }], __count: '1' } });
+    const result = await withWorkflow(createMockContext(), (workflow) =>
+      new ODataClient().collection(sizedQuery(2048, 'a'), row, { limit: 3, offset: 0 }, workflow),
+    );
+    expect(result).toEqual({ items: [{ ID: 1 }], totalCount: 1, hasMore: false });
+    expect(http.calls).toHaveLength(1);
+    expect(new URL(http.calls[0]?.request.url ?? '').search.length - 1).toBe(2048);
+  });
+
+  it.each(['a', 'é'] as const)(
+    'refuses a %s-padded query string one encoded byte over the limit before dispatch',
+    async (character) => {
+      vi.useFakeTimers();
+      respondLikeSource({ d: [] });
+      const sized = sizedQuery(2049, character);
+      const encoded = buildODataUrl(sized, 3, 0).search.slice(1);
+      expect(encoded).toHaveLength(2049);
+      if (character === 'é')
+        expect(decodeURIComponent(encoded.replaceAll('+', ' ')).length).toBeLessThan(800);
+      // No timer is advanced: a retry backoff or deadline wait would leave this pending.
+      const result = await withWorkflow(createMockContext(), async (workflow) => ({
+        error: await new ODataClient()
+          .collection(sized, row, { limit: 3, offset: 0 }, workflow)
+          .catch((caught: unknown) => caught),
+        sources: workflow.sources,
+      }));
+      expect(result.error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message:
+          'The text filters make the Parliament request 2049 bytes after URL encoding; the service accepts at most 2048.',
+        data: { reason: 'request_too_long' },
+      });
+      expect(http.calls).toHaveLength(0);
+      expect(result.sources).toEqual([]);
+    },
+  );
+
+  it('checks every source page a collection dispatches, not only the first', async () => {
+    respondLikeSource({ d: { results: [{ ID: 10 }], __count: '12' } });
+    const error = await withWorkflow(createMockContext(), (workflow) =>
+      new ODataClient().collection(
+        sizedQuery(2048, 'a', 3, 9),
+        row,
+        { limit: 3, offset: 9 },
+        workflow,
+      ),
+    ).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: expect.stringContaining('2049 bytes'),
+      data: { reason: 'request_too_long' },
+    });
+    expect(
+      http.calls.map(({ request }) => {
+        const url = new URL(request.url);
+        return [url.searchParams.get('$skip'), url.search.length - 1];
+      }),
+    ).toEqual([['9', 2048]]);
+  });
+
+  it('refuses an over-limit keyed lookup instead of reading the source page as a miss', async () => {
+    respondLikeSource({ d: { ID: 7 } });
+    const error = await withWorkflow(createMockContext(), (workflow) =>
+      new ODataClient().entity(
+        { entity: 'Vote', id: '7', language: 'de', select: ['ID', `A${'a'.repeat(2100)}`] },
+        row,
+        workflow,
+      ),
+    ).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'request_too_long' },
+    });
+    expect(http.calls).toHaveLength(0);
+  });
+});
+
 describe('OData failures and resilience', () => {
   it.each([400, 401, 403, 404])('never retries HTTP %i or exposes .NET bodies', async (status) => {
     respond(() => Response.json({ error: { innererror: 'private-dotnet-stack' } }, { status }));
-    await expect(collection()).rejects.toMatchObject({
+    const error = await collection().catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
       code:
         status === 401 || status === 403
           ? JsonRpcErrorCode.ServiceUnavailable
           : JsonRpcErrorCode.InternalError,
-      data: { status, retryable: false },
+      message: `Parliament Session request failed with HTTP ${status}.`,
     });
+    expect((error as McpError).data).toEqual({ status, endpoint: 'Session', retryable: false });
     expect(http.calls).toHaveLength(1);
+  });
+
+  it('reports a proxy HTML error page by its bare status, never its markup', async () => {
+    vi.useFakeTimers();
+    respond(
+      () =>
+        new Response(
+          '<!doctype html><html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>',
+          { status: 502, headers: { 'Content-Type': 'text/html' } },
+        ),
+    );
+    const pending = collection().catch((caught: unknown) => caught);
+    await vi.runAllTimersAsync();
+    const error = await pending;
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: 'Parliament Session request failed with HTTP 502. (failed after 2 attempts)',
+      data: { status: 502, endpoint: 'Session', retryable: true },
+    });
+    expect(JSON.stringify((error as McpError).data)).not.toMatch(/<|nginx|Bad Gateway/);
+    expect(http.calls).toHaveLength(2);
   });
 
   it.each(['{broken', '{"d":{"results":[{"ID":"wrong"}]}}'])(
@@ -379,6 +503,30 @@ describe('OData failures and resilience', () => {
     });
     await vi.runAllTimersAsync();
     await assertion;
+    expect(http.calls).toHaveLength(2);
+  });
+
+  it('reports a body stream that fails on every attempt as a retryable source stream failure', async () => {
+    vi.useFakeTimers();
+    respond(
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"d":'));
+              controller.error(new TypeError('connection reset'));
+            },
+          }),
+        ),
+    );
+    const pending = collection().catch((caught: unknown) => caught);
+    await vi.runAllTimersAsync();
+    const error = await pending;
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: 'Parliament Session response stream failed. (failed after 2 attempts)',
+      data: { endpoint: 'Session', retryable: true, retryAttempts: 2 },
+    });
     expect(http.calls).toHaveLength(2);
   });
 

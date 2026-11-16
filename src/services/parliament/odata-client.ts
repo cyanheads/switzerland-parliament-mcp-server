@@ -10,6 +10,7 @@ import {
   McpError,
   serializationError,
   serviceUnavailable,
+  validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import {
@@ -23,6 +24,18 @@ import { remainingWorkflowMs, type WorkflowContext } from './workflow.js';
 
 /** Verified Parliament OData origin; callers cannot choose a server. */
 const PARLIAMENT_ORIGIN = 'https://ws.parlament.ch';
+
+/**
+ * Longest URL-encoded query string, without its `?`, that the source serves. Its IIS front end
+ * answers a longer one with an HTML 404 page, whatever the path, and counts encoded bytes, so the
+ * client refuses a longer request before dispatch as `request_too_long`.
+ */
+export const MAX_QUERY_STRING_BYTES = 2048;
+
+/** Encoded query-string length without its `?`; percent-encoding leaves it all ASCII, so chars are bytes. */
+export function queryStringBytes(url: URL): number {
+  return url.search.length - 1;
+}
 
 /** Entity sets used by the record-research workflows. */
 export type ParliamentEntity =
@@ -302,6 +315,13 @@ export class ODataClient {
     workflow: WorkflowContext,
     expectedStatuses: number[] = [],
   ): Promise<T> {
+    // Checked on every dispatch, before the retry ladder.
+    const bytes = queryStringBytes(url);
+    if (bytes > MAX_QUERY_STRING_BYTES)
+      throw validationError(
+        `The text filters make the Parliament request ${bytes} bytes after URL encoding; the service accepts at most ${MAX_QUERY_STRING_BYTES}.`,
+        { reason: 'request_too_long' },
+      );
     const deadlineMs = remainingWorkflowMs(workflow);
     return withRetry(
       async (attempt) => {
@@ -329,13 +349,15 @@ export class ODataClient {
           text = await response.text();
         } catch (error) {
           remainingWorkflowMs(workflow);
-          if (error instanceof McpError || (error instanceof Error && error.name === 'AbortError'))
-            throw error;
-          throw serviceUnavailable(
-            `Parliament ${entity} response stream failed.`,
-            { endpoint: entity, retryable: true },
-            { cause: error },
-          );
+          // fetchWithTimeout reports a body that fails mid-stream as its network-error wrapper.
+          if (error instanceof McpError && error.data?.errorSource === 'FetchNetworkErrorWrapper') {
+            throw serviceUnavailable(
+              `Parliament ${entity} response stream failed.`,
+              { endpoint: entity, retryable: true },
+              { cause: error },
+            );
+          }
+          throw error;
         }
         const retrievedAt = new Date().toISOString();
         remainingWorkflowMs(workflow);
