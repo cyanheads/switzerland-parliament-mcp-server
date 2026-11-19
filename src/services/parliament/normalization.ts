@@ -64,6 +64,11 @@ export function odataDay(value: string, bound: 'start' | 'end' = 'start'): strin
   return `datetime'${IsoDaySchema.parse(value)}T${bound === 'start' ? '00:00:00' : '23:59:59.999'}'`;
 }
 
+/** Calendar days from one validated `YYYY-MM-DD` day to another, both ends counted. */
+export function inclusiveDaySpan(from: string, to: string): number {
+  return (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000 + 1;
+}
+
 /** Normalize a validated OData v2 wrapper, retaining an explicit offset when supplied. */
 export function normalizeODataDate(value: string): string {
   const match = /^\/Date\((-?\d+)([+-]\d{4})?\)\/$/.exec(value);

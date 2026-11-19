@@ -90,6 +90,69 @@ export const sansPapiersSubjectBusinesses = (
   SortOrder: index + 1,
 }));
 
+/** 16.077's 27 debate subjects with their meeting's Council, IdSession, and day, as published. */
+export const companyLawSubjects = (
+  [
+    ['43617', 1, 5013, '2018-06-14'],
+    ['43642', 1, 5013, '2018-06-14'],
+    ['43644', 1, 5013, '2018-06-15'],
+    ['44960', 2, 5015, '2018-12-11'],
+    ['45539', 2, 5016, '2019-03-12'],
+    ['45544', 2, 5016, '2019-03-12'],
+    ['46336', 1, 5018, '2019-06-13'],
+    ['46349', 1, 5018, '2019-06-13'],
+    ['46351', 1, 5018, '2019-06-13'],
+    ['46541', 2, 5018, '2019-06-19'],
+    ['46553', 2, 5018, '2019-06-19'],
+    ['47398', 2, 5019, '2019-09-26'],
+    ['48155', 2, 5101, '2019-12-18'],
+    ['48173', 1, 5101, '2019-12-19'],
+    ['48501', 2, 5102, '2020-03-04'],
+    ['48507', 1, 5102, '2020-03-04'],
+    ['48554', 2, 5102, '2020-03-09'],
+    ['48719', 1, 5102, '2020-03-11'],
+    ['48962', 2, 5104, '2020-06-02'],
+    ['48974', 1, 5104, '2020-06-03'],
+    ['49091', 1, 5104, '2020-06-08'],
+    ['49174', 2, 5104, '2020-06-09'],
+    ['49178', 2, 5104, '2020-06-09'],
+    ['49366', 1, 5104, '2020-06-16'],
+    ['49399', 2, 5104, '2020-06-18'],
+    ['49435', 2, 5104, '2020-06-19'],
+    ['49477', 1, 5104, '2020-06-19'],
+  ] as const
+).map(([IdSubject, council, sessionId, day]) => ({ IdSubject, council, sessionId, day }));
+
+/**
+ * Answer a SubjectBusiness read of business 20160077 from `companyLawSubjects`, applying its
+ * `Subjects/Meetings/*` navigation predicates as the source does: Council and IdSession by equality,
+ * Date against inclusive datetime day bounds. Without `withCount` the page carries no `__count`.
+ */
+export function companyLawSubjectPage(url: URL, withCount = true) {
+  const filter = url.searchParams.get('$filter') ?? '';
+  const council = /Subjects\/Meetings\/Council eq (\d+)/.exec(filter)?.[1];
+  const sessionId = /Subjects\/Meetings\/IdSession eq (\d+)/.exec(filter)?.[1];
+  const from = /Subjects\/Meetings\/Date ge datetime'([\d-]+)T00:00:00'/.exec(filter)?.[1];
+  const to = /Subjects\/Meetings\/Date le datetime'([\d-]+)T23:59:59\.999'/.exec(filter)?.[1];
+  const matching = companyLawSubjects.filter(
+    (subject) =>
+      (council === undefined || String(subject.council) === council) &&
+      (sessionId === undefined || String(subject.sessionId) === sessionId) &&
+      (from === undefined || subject.day >= from) &&
+      (to === undefined || subject.day <= to),
+  );
+  const offset = Number(url.searchParams.get('$skip'));
+  const top = Number(url.searchParams.get('$top'));
+  return Response.json({
+    d: {
+      results: matching
+        .slice(offset, offset + top)
+        .map(({ IdSubject }) => ({ IdSubject, BusinessNumber: 20160077, Language: 'DE' })),
+      ...(withCount && { __count: String(matching.length) }),
+    },
+  });
+}
+
 /** The subject IDs a SubjectBusiness lookup request names, in filter order. */
 export function requestedSubjects(url: URL): string[] {
   return [...(url.searchParams.get('$filter') ?? '').matchAll(/IdSubject eq (\d+)L/g)].map(

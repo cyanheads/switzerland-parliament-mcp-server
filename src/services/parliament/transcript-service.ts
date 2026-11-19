@@ -14,6 +14,7 @@ import { resolveBusiness } from './business-service.js';
 import {
   Int64IdSchema,
   type Language,
+  odataDay,
   odataInt32,
   odataInt64,
   odataString,
@@ -60,6 +61,21 @@ const SUBJECT_PAGE_ROWS = 1000;
 const SUBJECT_LOOKUP_BOUND_MS = 10_000;
 const SUBJECT_LOOKUP_DEADLINE_MARGIN_MS = 1_000;
 
+/**
+ * Debate order: meeting day, sitting, subject, then speaking order within the subject. `SortOrder`
+ * numbers each subject's passages from 1 and `MeetingVerbalixOid` identifies the sitting, so every
+ * debate reads contiguously and a day's sittings stay apart; `ID` last makes the order total, so
+ * offset paging neither repeats nor skips. Subjects within a sitting follow `IdSubject`, not agenda
+ * order: the source sorts a `Subjects/SortOrder` join over every matching row.
+ */
+const PASSAGE_ORDER: ODataQuery['orderBy'] = [
+  { field: 'MeetingDate', direction: 'asc' },
+  { field: 'MeetingVerbalixOid', direction: 'asc' },
+  { field: 'IdSubject', direction: 'asc' },
+  { field: 'SortOrder', direction: 'asc' },
+  { field: 'ID', direction: 'asc' },
+];
+
 /** Exact lookup remains a single-item resolution and preserves missing-key semantics. */
 export async function getTranscript(
   id: string,
@@ -85,7 +101,90 @@ export interface TranscriptSearchResult extends ODataPage<Transcript> {
   readonly scopeFound?: boolean;
 }
 
-/** Resolve all associated subjects before one OR-filtered passage query; never use Business/Transcripts. */
+/** Most debate subjects one business search ORs into its passage query. */
+const BUSINESS_SUBJECT_CAP = 20;
+
+/** The source's Meeting.Council code for each council selector. */
+const MEETING_COUNCIL = { N: 1, S: 2 } as const satisfies Record<
+  NonNullable<TranscriptFilters['council']>,
+  number
+>;
+
+/** A business's debate subjects, or that more than the cap match. */
+type BusinessSubjects =
+  | { readonly tooBroad: false; readonly subjects: string[] }
+  | { readonly tooBroad: true };
+
+/**
+ * Read a business's debate subjects, narrowed by `meeting` predicates on each subject's meeting.
+ * One capped page with count; a count-free full page is probed with one more row.
+ */
+async function readBusinessSubjects(
+  businessId: number,
+  meeting: readonly string[],
+  language: Language,
+  workflow: WorkflowContext,
+): Promise<BusinessSubjects> {
+  const query: ODataQuery = {
+    entity: 'SubjectBusiness',
+    language,
+    select: ['IdSubject', 'BusinessNumber', 'Language'],
+    orderBy: [{ field: 'IdSubject', direction: 'asc' }],
+    filter: [`BusinessNumber eq ${odataInt32(String(businessId))}`, ...meeting].join(' and '),
+  };
+  const page = await client.collection(
+    query,
+    RawSubjectSchema,
+    { limit: BUSINESS_SUBJECT_CAP, offset: 0 },
+    workflow,
+  );
+  // A count-free full page has unknown continuation; distinguish exactly 20 from more than 20.
+  const sentinel =
+    page.totalCount === undefined && page.hasMore
+      ? await client.collection(
+          query,
+          RawSubjectSchema,
+          { limit: 1, offset: page.items.length },
+          workflow,
+        )
+      : undefined;
+  if (
+    (page.totalCount !== undefined && page.totalCount > BUSINESS_SUBJECT_CAP) ||
+    (sentinel !== undefined ? sentinel.items.length > 0 : page.hasMore)
+  )
+    return { tooBroad: true };
+  for (const row of page.items) {
+    if (row.BusinessNumber !== businessId || row.Language !== language.toUpperCase())
+      throw serializationError('Parliament returned a mismatched business debate subject.');
+  }
+  return { tooBroad: false, subjects: [...new Set(page.items.map((row) => row.IdSubject))] };
+}
+
+/**
+ * Predicates on a subject's meeting for the search's council, session, and inclusive day filters.
+ * A subject's meeting has the same day, session, and council as each of its passages, so narrowing
+ * by them drops no matching passage. A speaker cannot narrow: filtering subjects by their passages'
+ * speaker needs `any()`, which the source's OData v2 lacks.
+ */
+function meetingPredicates(filters: TranscriptFilters): string[] {
+  const predicates: string[] = [];
+  if (filters.council !== undefined)
+    predicates.push(`Subjects/Meetings/Council eq ${MEETING_COUNCIL[filters.council]}`);
+  if (filters.sessionId !== undefined)
+    predicates.push(`Subjects/Meetings/IdSession eq ${odataInt32(filters.sessionId)}`);
+  if (filters.dateFrom !== undefined)
+    predicates.push(`Subjects/Meetings/Date ge ${odataDay(filters.dateFrom)}`);
+  if (filters.dateTo !== undefined)
+    predicates.push(`Subjects/Meetings/Date le ${odataDay(filters.dateTo, 'end')}`);
+  return predicates;
+}
+
+/**
+ * Resolve all associated subjects before one OR-filtered passage query; never use
+ * Business/Transcripts. A business over the subject cap is re-read once under the search's
+ * meeting filters and searched when they leave at most the cap; a business within it sends no
+ * extra request.
+ */
 export async function searchTranscripts(
   filters: TranscriptFilters,
   paging: { limit: number; offset: number },
@@ -95,43 +194,29 @@ export async function searchTranscripts(
   if (filters.businessId !== undefined) {
     const business = await resolveBusiness(filters.businessId, filters.language, workflow);
     if (!business) return { items: [], hasMore: false, scopeFound: false };
-    const subjectQuery: ODataQuery = {
-      entity: 'SubjectBusiness',
-      language: filters.language,
-      select: ['IdSubject', 'BusinessNumber', 'Language'],
-      orderBy: [{ field: 'IdSubject', direction: 'asc' }],
-      filter: `BusinessNumber eq ${odataInt32(String(business.ID))}`,
-    };
-    const subjectPage = await client.collection(
-      subjectQuery,
-      RawSubjectSchema,
-      { limit: 20, offset: 0 },
-      workflow,
-    );
-    // A count-free full page has unknown continuation; distinguish exactly 20 from more than 20.
-    const sentinel =
-      subjectPage.totalCount === undefined && subjectPage.hasMore
-        ? await client.collection(
-            subjectQuery,
-            RawSubjectSchema,
-            { limit: 1, offset: subjectPage.items.length },
-            workflow,
-          )
-        : undefined;
-    if (
-      (subjectPage.totalCount !== undefined && subjectPage.totalCount > 20) ||
-      (sentinel !== undefined ? sentinel.items.length > 0 : subjectPage.hasMore)
-    )
-      throw validationError('This business has more than 20 associated debate subjects.', {
-        reason: 'business_scope_too_broad',
-      });
-    for (const row of subjectPage.items) {
-      if (row.BusinessNumber !== business.ID || row.Language !== filters.language.toUpperCase())
-        throw serializationError('Parliament returned a mismatched business debate subject.');
-    }
-    subjects = [...new Set(subjectPage.items.map((row) => row.IdSubject))];
-    if (subjects.length === 0)
-      return { items: [], hasMore: false, totalCount: 0, scopeFound: true, noSubjects: true };
+    const all = await readBusinessSubjects(business.ID, [], filters.language, workflow);
+    const meeting = meetingPredicates(filters);
+    const narrowed = all.tooBroad && meeting.length > 0;
+    const read = narrowed
+      ? await readBusinessSubjects(business.ID, meeting, filters.language, workflow)
+      : all;
+    if (read.tooBroad)
+      throw validationError(
+        narrowed
+          ? 'This business has more than 20 associated debate subjects, and more than 20 remain after the council, session, and date filters.'
+          : 'This business has more than 20 associated debate subjects.',
+        { reason: 'business_scope_too_broad' },
+      );
+    // A business narrowed to no subject is a no-match, not a business without published subjects.
+    if (read.subjects.length === 0)
+      return {
+        items: [],
+        hasMore: false,
+        totalCount: 0,
+        scopeFound: true,
+        ...(!narrowed && { noSubjects: true }),
+      };
+    subjects = read.subjects;
   } else if (filters.subjectId !== undefined) subjects = [filters.subjectId];
 
   const predicates: string[] = [];
@@ -154,7 +239,7 @@ export async function searchTranscripts(
       entity: 'Transcript',
       language: filters.language,
       select: TRANSCRIPT_FIELDS,
-      orderBy: [{ field: 'ID', direction: 'asc' }],
+      orderBy: PASSAGE_ORDER,
       filter: predicates.join(' and '),
     },
     RawTranscriptSchema,

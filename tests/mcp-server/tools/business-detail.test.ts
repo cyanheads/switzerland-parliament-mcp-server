@@ -11,7 +11,7 @@ import { getBusinessTool } from '@/mcp-server/tools/definitions/get-business.too
 import { listBusinessSection } from '@/services/parliament/business-relations.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import { businessRow, businessSummary, expectBusinessParity } from '../../helpers/business.js';
-import { parliamentHttp, textContent } from '../../helpers/parliament.js';
+import { parliamentHttp, resultBytes, textContent } from '../../helpers/parliament.js';
 
 let http: ReturnType<typeof parliamentHttp>;
 beforeEach(() => {
@@ -28,12 +28,24 @@ function serveBusiness(row: unknown) {
 
 const guid = '00000000-0000-4000-8000-000000000001';
 const modified = '1970-01-01T00:00:01.000';
+/** The expanded Subject and Meeting of a SubjectBusiness row, as `$expand=Subjects/Meetings` returns them. */
+const subjectMeeting = {
+  Language: 'DE',
+  Meetings: {
+    Language: 'DE',
+    Date: '/Date(1576627200000)/',
+    CouncilName: 'Ständerat',
+    IdSession: 5101,
+    SessionName: 'Wintersession 2019',
+  },
+};
 const relationCases = [
   {
     section: 'status_history',
     entity: 'BusinessStatus',
     key: 'statusHistory',
     order: 'BusinessStatusDate asc,ID asc',
+    expand: null,
     row: {
       ID: guid,
       BusinessStatusId: 9999,
@@ -58,6 +70,7 @@ const relationCases = [
     entity: 'Bill',
     key: 'bills',
     order: 'BillNumber asc,ID asc',
+    expand: null,
     row: {
       ID: guid,
       BillNumber: 1,
@@ -89,6 +102,7 @@ const relationCases = [
     entity: 'RelatedBusiness',
     key: 'relatedBusiness',
     order: 'RelatedBusinessNumber asc,ID asc',
+    expand: null,
     row: {
       ID: guid,
       RelatedBusinessNumber: 20991235,
@@ -117,6 +131,7 @@ const relationCases = [
     entity: 'Preconsultation',
     key: 'preconsultations',
     order: 'PreconsultationDate asc,ID asc',
+    expand: null,
     row: {
       ID: guid,
       IdBill: guid,
@@ -149,12 +164,14 @@ const relationCases = [
     entity: 'SubjectBusiness',
     key: 'subjects',
     order: 'IdSubject asc',
+    expand: 'Subjects/Meetings',
     row: {
       IdSubject: '9007199254740993',
       Title: 'Débat',
       SortOrder: 0,
       PublishedNotes: '<p>Notes\r\n```</p>',
       Modified: '/Date(1000)/',
+      Subjects: subjectMeeting,
     },
     expected: {
       subjectId: '9007199254740993',
@@ -163,6 +180,10 @@ const relationCases = [
       sortOrder: 0,
       publishedNotes: '<p>Notes\r\n```</p>',
       modifiedAt: modified,
+      meetingDate: '2019-12-18',
+      councilName: 'Ständerat',
+      sessionId: '5101',
+      sessionName: 'Wintersession 2019',
     },
   },
 ] as const;
@@ -203,7 +224,30 @@ const selectableValues: Record<string, unknown> = {
   IdSubject: '1',
   SortOrder: 0,
   PublishedNotes: 'N',
+  'Subjects/Language': 'DE',
+  'Subjects/Meetings/Language': 'DE',
+  'Subjects/Meetings/Date': '/Date(0)/',
+  'Subjects/Meetings/CouncilName': 'C',
+  'Subjects/Meetings/IdSession': 1,
+  'Subjects/Meetings/SessionName': 'S',
 };
+
+/** Build the source row a `$select` list describes, nesting each navigation path's value. */
+function selectedRow(select: readonly string[]): Record<string, unknown> {
+  const row: Record<string, unknown> = {};
+  for (const field of select) {
+    if (!Object.hasOwn(selectableValues, field))
+      throw new Error(`No synthetic value for selected property ${field}.`);
+    const path = field.split('/');
+    let target = row;
+    for (const segment of path.slice(0, -1)) {
+      target[segment] ??= {};
+      target = target[segment] as Record<string, unknown>;
+    }
+    target[path.at(-1) ?? field] = selectableValues[field];
+  }
+  return row;
+}
 
 const AdvertisedRowsSchema = z.object({
   items: z.object({
@@ -301,7 +345,7 @@ describe('chparl_get_business', () => {
 
   it.each(relationCases)(
     'maps every $section field and its independent query',
-    async ({ section, entity, key, order, row, expected }) => {
+    async ({ section, entity, key, order, expand, row, expected }) => {
       http.reset();
       http.route({
         match: () => true,
@@ -340,9 +384,12 @@ describe('chparl_get_business', () => {
         "Language eq 'DE' and (BusinessNumber eq 20991234)",
       );
       expect(url.searchParams.get('$orderby')).toBe(order);
+      expect(url.searchParams.get('$expand')).toBe(expand);
       expect(url.searchParams.get('$inlinecount')).toBe('allpages');
       expect(url.searchParams.get('$top')).toBe('1');
       expect(url.searchParams.get('$skip')).toBe('2');
+      // The business read plus one section request; meeting context adds no request.
+      expect(http.calls).toHaveLength(2);
       expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$select')).not.toContain(
         'Description',
       );
@@ -359,14 +406,7 @@ describe('chparl_get_business', () => {
         match: () => true,
         respond: (request) => {
           const select = new URL(request.url).searchParams.get('$select')?.split(',') ?? [];
-          const row = Object.fromEntries(
-            select.map((field) => {
-              if (!Object.hasOwn(selectableValues, field))
-                throw new Error(`No synthetic value for selected property ${field}.`);
-              return [field, selectableValues[field]];
-            }),
-          );
-          return Response.json({ d: { results: [row], __count: '1' } });
+          return Response.json({ d: { results: [selectedRow(select)], __count: '1' } });
         },
       });
       const page = await withWorkflow(createMockContext(), (workflow) =>
@@ -434,13 +474,176 @@ describe('chparl_get_business', () => {
         'treatmentCategory',
       ],
     ],
-    ['subjects', ['modifiedAt', 'title', 'subjectId', 'businessId', 'sortOrder', 'publishedNotes']],
+    [
+      'subjects',
+      [
+        'modifiedAt',
+        'title',
+        'subjectId',
+        'businessId',
+        'sortOrder',
+        'publishedNotes',
+        'meetingDate',
+        'councilName',
+        'sessionId',
+        'sessionName',
+      ],
+    ],
   ] as const)('keeps the 0.1.2 field order of %s rows', (key, order) => {
     const advertised = AdvertisedRowsSchema.parse(
       z.toJSONSchema(getBusinessTool.output, { io: 'output', target: 'draft-2020-12' })
         .properties?.[key],
     );
     expect(Object.keys(advertised.items.properties)).toEqual(order);
+  });
+
+  function serveSubject(language: string, subjects?: unknown) {
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) =>
+        Response.json(
+          new URL(request.url).pathname.includes('Business(')
+            ? { d: { ...businessRow, Language: language } }
+            : {
+                d: {
+                  results: [
+                    {
+                      IdSubject: '48155',
+                      BusinessNumber: 20991234,
+                      Language: language,
+                      Title: 'OR. Aktienrecht',
+                      SortOrder: 1,
+                      PublishedNotes: 'Differenzen - Divergences\n',
+                      ...(subjects !== undefined && { Subjects: subjects }),
+                    },
+                  ],
+                  __count: '1',
+                },
+              },
+        ),
+    });
+  }
+
+  it.each([
+    {
+      name: 'French meeting labels',
+      language: 'fr',
+      subjects: {
+        Language: 'FR',
+        Meetings: {
+          Language: 'FR',
+          Date: '/Date(1576627200000)/',
+          CouncilName: 'Conseil des Etats',
+          IdSession: 5101,
+          SessionName: "Session d'hiver 2019",
+        },
+      },
+      meeting: {
+        meetingDate: '2019-12-18',
+        councilName: 'Conseil des Etats',
+        sessionId: '5101',
+        sessionName: "Session d'hiver 2019",
+      },
+    },
+    {
+      name: 'the local day of an explicit-offset meeting date',
+      language: 'de',
+      subjects: {
+        Language: 'DE',
+        Meetings: { ...subjectMeeting.Meetings, Date: '/Date(1576710000000+0060)/' },
+      },
+      meeting: {
+        meetingDate: '2019-12-19',
+        councilName: 'Ständerat',
+        sessionId: '5101',
+        sessionName: 'Wintersession 2019',
+      },
+    },
+    {
+      name: 'a sparse meeting',
+      language: 'de',
+      subjects: {
+        Language: 'DE',
+        Meetings: {
+          Language: 'DE',
+          Date: null,
+          CouncilName: 'Nationalrat',
+          IdSession: null,
+          SessionName: null,
+        },
+      },
+      meeting: { councilName: 'Nationalrat' },
+    },
+    {
+      name: 'a null meeting',
+      language: 'de',
+      subjects: { Language: 'DE', Meetings: null },
+      meeting: {},
+    },
+    { name: 'a null subject', language: 'de', subjects: null, meeting: {} },
+  ] as const)(
+    'maps the subject meeting context of $name',
+    async ({ language, subjects, meeting }) => {
+      serveSubject(language.toUpperCase(), subjects);
+      const result = await runToolContract(getBusinessTool, {
+        businessId: '20991234',
+        section: 'subjects',
+        language,
+      });
+      expect(result.isError).not.toBe(true);
+      expect(getBusinessTool.output.parse(result.structuredContent).subjects).toEqual([
+        {
+          subjectId: '48155',
+          businessId: '20991234',
+          title: 'OR. Aktienrecht',
+          sortOrder: 1,
+          publishedNotes: 'Differenzen - Divergences\n',
+          ...meeting,
+        },
+      ]);
+      expectBusinessParity(result);
+    },
+  );
+
+  it.each([
+    {
+      name: 'a deferred subject',
+      subjects: {
+        __deferred: {
+          uri: "https://ws.parlament.ch/odata.svc/SubjectBusiness(BusinessNumber=20991234,IdSubject=48155L,Language='DE')/Subjects",
+        },
+      },
+    },
+    {
+      name: 'a deferred meeting',
+      subjects: {
+        Language: 'DE',
+        Meetings: {
+          __deferred: {
+            uri: "https://ws.parlament.ch/odata.svc/Subject(ID=48155L,Language='DE')/Meetings",
+          },
+        },
+      },
+    },
+    { name: 'a subject in another language', subjects: { ...subjectMeeting, Language: 'FR' } },
+    {
+      name: 'a meeting in another language',
+      subjects: { Language: 'DE', Meetings: { ...subjectMeeting.Meetings, Language: 'FR' } },
+    },
+    { name: 'a missing expansion', subjects: undefined },
+    { name: 'a subject without its Meetings key', subjects: { Language: 'DE' } },
+  ])('rejects $name as a serialization error', async ({ subjects }) => {
+    serveSubject('DE', subjects);
+    const result = await runToolContract(getBusinessTool, {
+      businessId: '20991234',
+      section: 'subjects',
+    });
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.SerializationError },
+    });
+    expect(result.structuredContent).not.toHaveProperty('subjects');
+    expect(http.calls).toHaveLength(2);
   });
 
   it.each([
@@ -480,12 +683,13 @@ describe('chparl_get_business', () => {
     },
   );
 
-  it('fits whole relationship rows and advances by delivered rows', async () => {
+  it('returns every requested relationship row whatever its size and advances by delivered rows', async () => {
     const rows = Array.from({ length: 20 }, (_, index) => ({
       Language: 'DE',
       BusinessNumber: 20991234,
       IdSubject: String(index + 1),
       Title: `<p>${'é'.repeat(300)}\r\n${index}</p>`,
+      Subjects: subjectMeeting,
     }));
     http.reset();
     http.route({
@@ -503,27 +707,22 @@ describe('chparl_get_business', () => {
       offset: 5,
     });
     const items = getBusinessTool.output.parse(result.structuredContent).subjects ?? [];
-    expect(items.length).toBeGreaterThan(0);
-    expect(items.length).toBeLessThan(20);
-    expect(items.map((item) => item.title)).toEqual(
-      rows.slice(0, items.length).map((row) => row.Title),
-    );
+    expect(items.map((item) => item.title)).toEqual(rows.map((row) => row.Title));
     expect(result.structuredContent).toMatchObject({
-      returnedCount: items.length,
-      nextOffset: 5 + items.length,
+      returnedCount: 20,
+      effectiveLimit: 20,
+      nextOffset: 25,
       totalCount: 40,
       hasMore: true,
     });
-    expect(
-      new TextEncoder().encode(
-        JSON.stringify({ structuredContent: result.structuredContent, content: result.content }),
-      ).byteLength,
-    ).toBeLessThan(24_000);
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    // A page over 24,000 bytes still holds every row the limit asked for.
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
     expectBusinessParity(result);
   });
 
   it.each(relationCases)(
-    'fits and completely continues 100 full $section rows on both surfaces',
+    'returns and completely continues 100 full $section rows per page on both surfaces',
     async ({ section, row, expected, key }) => {
       const longField =
         section === 'status_history'
@@ -539,7 +738,8 @@ describe('chparl_get_business', () => {
           : section === 'preconsultations'
             ? 'committeeName'
             : 'title';
-      const rows = Array.from({ length: 100 }, (_, index) => ({
+      const total = 250;
+      const rows = Array.from({ length: total }, (_, index) => ({
         ...row,
         Language: 'DE',
         BusinessNumber: 20991234,
@@ -573,14 +773,15 @@ describe('chparl_get_business', () => {
           return Response.json({
             d: {
               results: rows.slice(offset, offset + Number(url.searchParams.get('$top'))),
-              __count: '100',
+              __count: String(total),
             },
           });
         },
       });
       const collected: unknown[] = [];
       let offset = 0;
-      for (;;) {
+      // Two full pages, then the short last page; the walk is bounded by these three calls.
+      for (const size of [100, 100, 50]) {
         const result = await runToolContract(getBusinessTool, {
           businessId: '20991234',
           section,
@@ -589,33 +790,26 @@ describe('chparl_get_business', () => {
         });
         expect(result.isError).not.toBe(true);
         const items = getBusinessTool.output.parse(result.structuredContent)[key] ?? [];
-        expect(items).toEqual(expectedRows.slice(offset, offset + items.length));
-        expect(items.length).toBeGreaterThan(0);
+        expect(items).toEqual(expectedRows.slice(offset, offset + size));
+        const more = offset + size < total;
         expect(result.structuredContent).toMatchObject({
           effectiveLimit: 100,
-          returnedCount: items.length,
-          totalCount: 100,
-          hasMore: offset + items.length < 100,
+          returnedCount: size,
+          totalCount: total,
+          hasMore: more,
+          ...(more && { nextOffset: offset + size }),
         });
-        expect(
-          new TextEncoder().encode(
-            JSON.stringify({
-              structuredContent: result.structuredContent,
-              content: result.content,
-            }),
-          ).byteLength,
-        ).toBeLessThan(24_000);
+        if (offset === 0) {
+          expect(result.structuredContent).toMatchObject({
+            notice: 'Requested limit 101 was clamped to 100.',
+          });
+        } else {
+          expect(result.structuredContent).not.toHaveProperty('notice');
+        }
+        if (!more) expect(result.structuredContent).not.toHaveProperty('nextOffset');
         expectBusinessParity(result);
         collected.push(...items);
-        offset += items.length;
-        if (offset === 100) {
-          expect(result.structuredContent).not.toHaveProperty('nextOffset');
-          break;
-        }
-        expect(result.structuredContent).toMatchObject({
-          nextOffset: offset,
-          notice: expect.stringContaining('whole'),
-        });
+        offset += size;
       }
       expect(collected).toEqual(expectedRows);
       expect(new URL(http.calls[1]?.request.url ?? '').searchParams.get('$top')).toBe('100');
@@ -623,13 +817,14 @@ describe('chparl_get_business', () => {
         businessId: '20991234',
         section,
         limit: 100,
-        offset: 100,
+        offset: total,
       });
       expect(pastEnd.structuredContent).toMatchObject({
         [key]: [],
-        totalCount: 100,
+        totalCount: total,
         returnedCount: 0,
         hasMore: false,
+        notice: expect.stringContaining('past the last relationship record'),
       });
       expect(pastEnd.structuredContent).not.toHaveProperty('nextOffset');
       expectBusinessParity(pastEnd);
@@ -990,7 +1185,7 @@ describe('chparl_get_business', () => {
     expect(JSON.stringify(result)).not.toContain('private-stack');
   });
 
-  it('preserves an indivisible oversized relationship row and names its exact retrieval path', async () => {
+  it('returns a relationship row over 24000 bytes whole on a limit:1 page without a size notice', async () => {
     const title = `<p>${'界'.repeat(12_000)}</p>`;
     http.reset();
     http.route({
@@ -1002,9 +1197,15 @@ describe('chparl_get_business', () => {
             : {
                 d: {
                   results: [
-                    { IdSubject: '1', BusinessNumber: 20991234, Language: 'DE', Title: title },
+                    {
+                      IdSubject: '1',
+                      BusinessNumber: 20991234,
+                      Language: 'DE',
+                      Title: title,
+                      Subjects: subjectMeeting,
+                    },
                   ],
-                  __count: '1',
+                  __count: '2',
                 },
               },
         ),
@@ -1017,11 +1218,12 @@ describe('chparl_get_business', () => {
     expect(result.structuredContent).toMatchObject({
       subjects: [{ subjectId: '1', title }],
       returnedCount: 1,
-      hasMore: false,
-      notice: expect.stringContaining(
-        'businessId:20991234, section:subjects, language:de, offset:0, limit:1',
-      ),
+      totalCount: 2,
+      nextOffset: 1,
+      hasMore: true,
     });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
     expectBusinessParity(result);
   });
 

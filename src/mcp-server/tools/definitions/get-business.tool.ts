@@ -29,14 +29,13 @@ import { LanguageSchema, MetadataLanguageSchema } from '@/services/parliament/no
 import { ProvenanceSchema, provenance } from '@/services/parliament/provenance.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import {
-  COLLECTION_RESULT_LIMIT_BYTES,
   clampNotice,
   completeResultBytes,
   fieldTrailer,
-  fitCollectionPage,
   formatParliamentResult,
   isPastEnd,
   joinNotices,
+  WHOLE_RESULT_NOTICE_BYTES,
 } from '../parliament-format.js';
 
 const EffectiveFiltersSchema = z
@@ -99,16 +98,13 @@ const EnrichmentSchema = z.object({
     .boolean()
     .optional()
     .describe('Whether selected relationship rows remain; absent for non-collection results.'),
-  notice: z
-    .string()
-    .optional()
-    .describe('Combined clamping, byte-fitting, empty-section, or past-end guidance.'),
+  notice: z.string().optional().describe('Combined clamping, empty-section, or past-end guidance.'),
 });
 
 /** Read independently addressable business sections without implying relationship completeness. */
 export const getBusinessTool = tool('chparl_get_business', {
   description:
-    'Read a Swiss parliamentary business by canonical eight-digit businessId or exact published short number. Choose overview for metadata and available text sizes; texts for original published text, automatically outlined when several fields exceed the disclosure budget; or status_history, bills, related_business, preconsultations, or subjects for independently paged relationships. textFields selects complete original fields only in texts, even when large. Paging applies only to relationships. Use subjects to narrow chparl_search_transcripts; source text and HTML remain unchanged.',
+    'Read a Swiss parliamentary business by canonical eight-digit businessId or exact published short number. Choose overview for metadata and available text sizes; texts for original published text, automatically outlined when several fields exceed the disclosure budget; or status_history, bills, related_business, preconsultations, or subjects for independently paged relationships. textFields selects complete original fields only in texts, even when large. Paging applies only to relationships. Use subjects to narrow chparl_search_transcripts: each debate subject carries its meeting date, council, and session, so pick the subjectId to search; source text and HTML remain unchanged.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     businessId: BusinessIdentifierSchema.describe(
@@ -172,7 +168,9 @@ export const getBusinessTool = tool('chparl_get_business', {
     subjects: z
       .array(SubjectRowSchema)
       .optional()
-      .describe('Debate subjects usable in chparl_search_transcripts.'),
+      .describe(
+        'Debate subjects with the date, council, and session of each meeting; pass a subjectId to chparl_search_transcripts.',
+      ),
     provenance: ProvenanceSchema,
   }),
   enrichment: EnrichmentSchema.shape,
@@ -249,7 +247,7 @@ export const getBusinessTool = tool('chparl_get_business', {
           textDocument: businessTextDocument(raw, input.textFields),
           provenance: provenance(workflow.sources),
         };
-        if (completeResultBytes(output, enrichment) >= COLLECTION_RESULT_LIMIT_BYTES) {
+        if (completeResultBytes(output, enrichment) >= WHOLE_RESULT_NOTICE_BYTES) {
           const populated = BusinessTextFieldSchema.options.filter(
             (name) => output.textDocument[name] !== undefined,
           );
@@ -277,40 +275,29 @@ export const getBusinessTool = tool('chparl_get_business', {
         preconsultations: 'preconsultations',
         subjects: 'subjects',
       }[input.section];
-      const prepared = fitCollectionPage(result.items, (items, cut, oversized) => {
-        const hasMore = cut || result.hasMore;
-        const notice = joinNotices(
-          clampNotice(requestedLimit, paging.limit),
-          cut &&
-            'Response byte fitting returned fewer whole relationship rows. Continue with nextOffset; no field was shortened.',
-          items.length === 0 &&
-            (isPastEnd(result.totalCount, paging.offset)
-              ? `This offset is past the last relationship record. Call chparl_get_business with businessId:${business.businessId}, section:${input.section}, language:${input.language}, offset:0.`
-              : 'This business has no published records in this section. Use another chparl_get_business section or chparl_search_transcripts for its debate.'),
-          oversized &&
-            `One indivisible record or its provenance exceeds 24000 bytes and is returned whole. Retrieve it with chparl_get_business businessId:${business.businessId}, section:${input.section}, language:${input.language}, offset:${paging.offset}, limit:1.`,
-        );
-        return {
-          output: {
-            found: true,
-            section: input.section,
-            business,
-            [key]: items,
-            provenance: provenance(workflow.sources),
-          },
-          enrichment: {
-            effectiveFilters: filters,
-            returnedCount: items.length,
-            effectiveLimit: paging.limit,
-            ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
-            ...(hasMore && { nextOffset: paging.offset + items.length }),
-            hasMore,
-            ...(notice !== undefined && { notice }),
-          },
-        };
+      const notice = joinNotices(
+        clampNotice(requestedLimit, paging.limit),
+        result.items.length === 0 &&
+          (isPastEnd(result.totalCount, paging.offset)
+            ? `This offset is past the last relationship record. Call chparl_get_business with businessId:${business.businessId}, section:${input.section}, language:${input.language}, offset:0.`
+            : 'This business has no published records in this section. Use another chparl_get_business section or chparl_search_transcripts for its debate.'),
+      );
+      ctx.enrich({
+        effectiveFilters: filters,
+        returnedCount: result.items.length,
+        effectiveLimit: paging.limit,
+        ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
+        ...(result.nextOffset !== undefined && { nextOffset: result.nextOffset }),
+        hasMore: result.hasMore,
+        ...(notice !== undefined && { notice }),
       });
-      ctx.enrich(prepared.enrichment);
-      return prepared.output;
+      return {
+        found: true,
+        section: input.section,
+        business,
+        [key]: result.items,
+        provenance: provenance(workflow.sources),
+      };
     });
   },
   format: formatParliamentResult,

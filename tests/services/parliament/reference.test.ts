@@ -88,6 +88,12 @@ describe('Parliament reference data', () => {
       expected: { id: '90', label: 'Type', abbreviation: '' },
     },
     {
+      topic: 'tags',
+      entity: 'Tags',
+      fields: { TagName: 'Énergie' },
+      expected: { id: '90', label: 'Énergie' },
+    },
+    {
       topic: 'councils',
       entity: 'Council',
       fields: { CouncilName: 'Conseil synthétique', CouncilAbbreviation: 'SYN' },
@@ -163,6 +169,75 @@ describe('Parliament reference data', () => {
       expect(result.sources).toHaveLength(1);
     },
   );
+
+  it.each([
+    [
+      'business_types',
+      'BusinessType?%24format=json&%24filter=Language+eq+%27DE%27&%24select=ID%2CLanguage%2CBusinessTypeName%2CBusinessTypeAbbreviation&%24orderby=ID+asc&%24inlinecount=allpages&%24top=100&%24skip=0',
+    ],
+    [
+      'tags',
+      'Tags?%24format=json&%24filter=Language+eq+%27DE%27&%24select=ID%2CLanguage%2CTagName&%24orderby=ID+asc&%24inlinecount=allpages&%24top=100&%24skip=0',
+    ],
+    [
+      'councils',
+      'Council?%24format=json&%24filter=Language+eq+%27DE%27&%24select=ID%2CLanguage%2CCouncilName%2CCouncilAbbreviation&%24orderby=ID+asc&%24inlinecount=allpages&%24top=100&%24skip=0',
+    ],
+    [
+      'cantons',
+      'Canton?%24format=json&%24filter=Language+eq+%27DE%27&%24select=ID%2CLanguage%2CCantonNumber%2CCantonName%2CCantonAbbreviation&%24orderby=CantonNumber+asc%2CID+asc&%24inlinecount=allpages&%24top=100&%24skip=0',
+    ],
+    [
+      'parties',
+      'Party?%24format=json&%24filter=Language+eq+%27DE%27&%24select=ID%2CLanguage%2CPartyNumber%2CPartyName%2CPartyAbbreviation%2CStartDate%2CEndDate&%24orderby=PartyNumber+asc%2CID+asc&%24inlinecount=allpages&%24top=100&%24skip=0',
+    ],
+    [
+      'groups',
+      'ParlGroup?%24format=json&%24filter=Language+eq+%27DE%27&%24select=ID%2CLanguage%2CParlGroupNumber%2CParlGroupName%2CParlGroupAbbreviation%2CParlGroupCode%2CIsActive&%24orderby=ParlGroupNumber+asc%2CID+asc&%24inlinecount=allpages&%24top=100&%24skip=0',
+    ],
+    [
+      'committees',
+      'Committee?%24format=json&%24filter=Language+eq+%27DE%27&%24select=ID%2CLanguage%2CCommitteeNumber%2CCommitteeName%2CAbbreviation1%2CCouncil%2CCommitteeTypeName&%24orderby=CommitteeNumber+asc%2CID+asc&%24inlinecount=allpages&%24top=100&%24skip=0',
+    ],
+    [
+      'sessions',
+      'Session?%24format=json&%24filter=Language+eq+%27DE%27&%24select=ID%2CLanguage%2CSessionName%2CAbbreviation%2CSessionNumber%2CTypeName%2CLegislativePeriodNumber%2CStartDate%2CEndDate&%24orderby=StartDate+desc%2CID+desc&%24inlinecount=allpages&%24top=100&%24skip=0',
+    ],
+  ] as const)('sends the exact unfiltered %s request', async (topic, request) => {
+    http = parliamentHttp(() => Response.json({ d: { results: [], __count: '0' } }));
+    await list(topic);
+    expect(http.calls.map((call) => call.request.url)).toEqual([
+      `https://ws.parlament.ch/odata.svc/${request}`,
+    ]);
+  });
+
+  it.each([
+    ['committees', 'CommitteeName', 'Abbreviation1', 'CommitteeNumber asc,ID asc'],
+    ['parties', 'PartyName', 'PartyAbbreviation', 'PartyNumber asc,ID asc'],
+    ['groups', 'ParlGroupName', 'ParlGroupAbbreviation', 'ParlGroupNumber asc,ID asc'],
+  ] as const)(
+    'conjoins query on the rendered %s label and abbreviation before ordering, paging, and counting',
+    async (topic, label, abbreviation, orderBy) => {
+      http = parliamentHttp(() => Response.json({ d: { results: [], __count: '0' } }));
+      await list(topic, { query: 'WAK', limit: 2, offset: 2 });
+      const url = new URL(http.calls[0]?.request.url ?? '');
+      expect(url.searchParams.get('$filter')).toBe(
+        `Language eq 'DE' and ((substringof('WAK',${label}) or substringof('WAK',${abbreviation})))`,
+      );
+      expect(url.searchParams.get('$orderby')).toBe(orderBy);
+      expect(url.searchParams.get('$inlinecount')).toBe('allpages');
+      expect(url.searchParams.get('$top')).toBe('2');
+      expect(url.searchParams.get('$skip')).toBe('2');
+    },
+  );
+
+  it('escapes an apostrophe in query and sends its case and accents unchanged', async () => {
+    http = parliamentHttp(() => Response.json({ d: { results: [], __count: '0' } }));
+    await list('committees', { language: 'fr', query: "l'Économie" });
+    expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$filter')).toBe(
+      "Language eq 'FR' and ((substringof('l''Économie',CommitteeName) or substringof('l''Économie',Abbreviation1)))",
+    );
+  });
 
   it('conjoins session date bounds and stable source ordering without local filtering', async () => {
     http = parliamentHttp(() => Response.json({ d: [] }));

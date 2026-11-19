@@ -10,8 +10,11 @@ import type { MemberSearchFilters } from '@/services/parliament/member-model.js'
 import { MemberService } from '@/services/parliament/member-service.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import {
+  committeeHistoryRow,
   committeeRow,
+  historyRosterRow,
   interestRow,
+  interestSearchRow,
   memberGuid,
   memberRow,
   personRow,
@@ -299,6 +302,85 @@ describe('MemberService', () => {
     );
   });
 
+  it('pages one person’s committee history oldest first, mapping a row that names no committee', async () => {
+    http = parliamentHttp(() =>
+      Response.json({
+        d: {
+          results: [
+            {
+              ID: memberGuid(6),
+              PersonNumber: 91,
+              Language: 'DE',
+              CommitteeNumber: null,
+              CommitteeName: null,
+              Abbreviation: null,
+              Abbreviation1: null,
+              Abbreviation2: null,
+              CommitteeFunction: null,
+              CommitteeFunctionName: null,
+              DateJoining: null,
+              DateLeaving: null,
+              Council: 1,
+              CouncilName: 'Nationalrat',
+              CouncilAbbreviation: 'NR',
+            },
+            committeeHistoryRow(),
+            committeeHistoryRow({
+              ID: memberGuid(7),
+              DateJoining: '/Date(1701648000000)/',
+              DateLeaving: null,
+            }),
+          ],
+          __count: '3',
+        },
+      }),
+    );
+    const page = await withWorkflow(createMockContext(), (workflow) =>
+      new MemberService().committeeHistory('91', 'de', { limit: 20, offset: 0 }, workflow),
+    );
+    expect(page).toMatchObject({ totalCount: 3, hasMore: false });
+    expect(page.items).toEqual([
+      {
+        id: memberGuid(6),
+        councilId: '1',
+        councilName: 'Nationalrat',
+        councilAbbreviation: 'NR',
+        sourceUrl:
+          "https://ws.parlament.ch/odata.svc/MemberCommitteeHistory(ID=guid'00000000-0000-4000-8000-000000000006',Language='DE')",
+      },
+      {
+        id: memberGuid(5),
+        committeeId: '10',
+        committeeName: 'Commission historique',
+        abbreviation: 'CH-NR',
+        abbreviation1: 'CH-N',
+        abbreviation2: '',
+        councilId: '1',
+        councilName: 'Nationalrat',
+        councilAbbreviation: 'NR',
+        functionId: 0,
+        functionName: 'Mitglied',
+        joinedDate: '2011-12-15T00:00:00.000',
+        leftDate: '2015-11-29T00:00:00.000',
+        sourceUrl:
+          "https://ws.parlament.ch/odata.svc/MemberCommitteeHistory(ID=guid'00000000-0000-4000-8000-000000000005',Language='DE')",
+      },
+      expect.objectContaining({ id: memberGuid(7), joinedDate: '2023-12-04T00:00:00.000' }),
+    ]);
+    expect(page.items[2]).not.toHaveProperty('leftDate');
+    expect(page.items[2]).not.toHaveProperty('committeeTypeId');
+    expect(http.calls).toHaveLength(1);
+    const url = new URL(http.calls[0]?.request.url ?? '');
+    expect(url.pathname).toBe('/odata.svc/MemberCommitteeHistory');
+    expect(url.searchParams.get('$filter')).toBe("Language eq 'DE' and (PersonNumber eq 91)");
+    expect(url.searchParams.get('$orderby')).toBe('DateJoining asc,ID asc');
+    expect(url.searchParams.get('$select')).toBe(
+      'ID,Language,PersonNumber,CommitteeNumber,CommitteeName,Abbreviation,Abbreviation1,Abbreviation2,Council,CouncilName,CouncilAbbreviation,CommitteeFunction,CommitteeFunctionName,DateJoining,DateLeaving',
+    );
+    expect(url.searchParams.get('$expand')).toBeNull();
+    expect(url.searchParams.get('$inlinecount')).toBe('allpages');
+  });
+
   it('maps every interest field and distinguishes Paid false, null, absent and true', async () => {
     http = parliamentHttp(() =>
       Response.json({
@@ -326,16 +408,18 @@ describe('MemberService', () => {
       paid: false,
       sortOrder: 0,
       modifiedAt: '1969-12-31T22:30:00.000-01:30',
+      dateFrom: '2023-02-15T00:00:00.000',
       sourceUrl:
         "https://ws.parlament.ch/odata.svc/PersonInterest(ID=guid'00000000-0000-4000-8000-000000000002',Language='DE')",
     });
     expect(page.items[1]).not.toHaveProperty('paid');
+    expect(page.items[1]).not.toHaveProperty('dateFrom');
     expect(page.items[2]).not.toHaveProperty('paid');
     expect(page.items[3]).toHaveProperty('paid', true);
     const url = new URL(http.calls[0]?.request.url ?? '');
     expect(url.searchParams.get('$orderby')).toBe('SortOrder asc,ID asc');
     expect(url.searchParams.get('$select')).toBe(
-      'ID,Language,PersonNumber,InterestName,Agency,InterestType,InterestTypeText,OrganizationType,OrganizationTypeText,FunctionInAgency,FunctionInAgencyText,Paid,SortOrder,Modified',
+      'ID,Language,PersonNumber,InterestName,Agency,InterestType,InterestTypeText,OrganizationType,OrganizationTypeText,FunctionInAgency,FunctionInAgencyText,Paid,SortOrder,Modified,DateFrom',
     );
   });
 
@@ -349,6 +433,11 @@ describe('MemberService', () => {
       method: 'committees',
       entity: 'MemberCommittee',
       row: (id: number) => committeeRow({ ID: memberGuid(id) }),
+    },
+    {
+      method: 'committeeHistory',
+      entity: 'MemberCommitteeHistory',
+      row: (id: number) => committeeHistoryRow({ ID: memberGuid(id) }),
     },
     {
       method: 'interests',
@@ -393,34 +482,40 @@ describe('MemberService', () => {
     },
   );
 
-  it.each(['search', 'person', 'memberships', 'councilTerms', 'committees', 'interests'] as const)(
-    'rejects an unexpected source metadata language in %s',
-    async (operation) => {
-      const rows = {
-        search: memberRow(),
-        person: personRow(),
-        memberships: memberRow(),
-        councilTerms: memberRow({ ID: memberGuid(3) }),
-        committees: committeeRow(),
-        interests: interestRow(),
-      };
-      http = parliamentHttp(() => Response.json({ d: [{ ...rows[operation], Language: 'IT' }] }));
-      const service = new MemberService();
-      await expect(
-        withWorkflow<unknown>(createMockContext(), (workflow) => {
-          if (operation === 'search')
-            return service.searchMembers(
-              { language: 'de', membership: 'all', limit: 20, offset: 0 },
-              workflow,
-            );
-          if (operation === 'person') return service.getPerson('91', 'de', workflow);
-          if (operation === 'memberships') return service.memberships('91', 'de', workflow);
-          return service[operation]('91', 'de', { limit: 20, offset: 0 }, workflow);
-        }),
-      ).rejects.toMatchObject({ code: JsonRpcErrorCode.SerializationError });
-      expect(http.calls).toHaveLength(1);
-    },
-  );
+  it.each([
+    'search',
+    'person',
+    'memberships',
+    'councilTerms',
+    'committees',
+    'committeeHistory',
+    'interests',
+  ] as const)('rejects an unexpected source metadata language in %s', async (operation) => {
+    const rows = {
+      search: memberRow(),
+      person: personRow(),
+      memberships: memberRow(),
+      councilTerms: memberRow({ ID: memberGuid(3) }),
+      committees: committeeRow(),
+      committeeHistory: committeeHistoryRow(),
+      interests: interestRow(),
+    };
+    http = parliamentHttp(() => Response.json({ d: [{ ...rows[operation], Language: 'IT' }] }));
+    const service = new MemberService();
+    await expect(
+      withWorkflow<unknown>(createMockContext(), (workflow) => {
+        if (operation === 'search')
+          return service.searchMembers(
+            { language: 'de', membership: 'all', limit: 20, offset: 0 },
+            workflow,
+          );
+        if (operation === 'person') return service.getPerson('91', 'de', workflow);
+        if (operation === 'memberships') return service.memberships('91', 'de', workflow);
+        return service[operation]('91', 'de', { limit: 20, offset: 0 }, workflow);
+      }),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.SerializationError });
+    expect(http.calls).toHaveLength(1);
+  });
 });
 
 describe('MemberService committee rosters', () => {
@@ -669,6 +764,442 @@ describe('MemberService committee rosters', () => {
       nextOffset: 2,
       committeeFound: true,
     });
+    expect(http.calls).toHaveLength(2);
+  });
+});
+
+describe('MemberService committee rosters on a past day', () => {
+  const historySelect = [
+    'ID',
+    'Language',
+    'PersonNumber',
+    'FirstName',
+    'LastName',
+    'CommitteeFunction',
+    'CommitteeFunctionName',
+    'DateJoining',
+    'DateLeaving',
+    'Council',
+    'CouncilName',
+    'CouncilAbbreviation',
+    'Canton',
+    'CantonName',
+    'CantonAbbreviation',
+    'PartyNumber',
+    'PartyName',
+    'PartyAbbreviation',
+    'ParlGroupNumber',
+    'ParlGroupName',
+    'ParlGroupAbbreviation',
+    'MembersCouncil/ID',
+    'MembersCouncil/Language',
+    'MembersCouncil/OfficialName',
+  ];
+  const onDay =
+    "CommitteeNumber eq 12 and DateJoining le datetime'2014-03-03T23:59:59.999' and (DateLeaving ge datetime'2014-03-03T00:00:00' or DateLeaving eq null)";
+
+  it('pages MemberCommitteeHistory memberships open on asOf with only identity fields expanded', async () => {
+    http = parliamentHttp(() =>
+      Response.json({ d: { results: [historyRosterRow()], __count: '4' } }),
+    );
+    await search({ committeeId: '12', asOf: '2014-03-03', limit: 7, offset: 3 });
+    expect(http.calls).toHaveLength(1);
+    const url = new URL(http.calls[0]?.request.url ?? '');
+    expect(url.pathname).toBe('/odata.svc/MemberCommitteeHistory');
+    expect(url.searchParams.get('$filter')).toBe(`Language eq 'DE' and (${onDay})`);
+    expect(url.searchParams.get('$expand')).toBe('MembersCouncil');
+    expect(url.searchParams.get('$select')?.split(',')).toEqual(historySelect);
+    expect(url.searchParams.get('$orderby')).toBe('LastName asc,FirstName asc,ID asc');
+    expect(url.searchParams.get('$inlinecount')).toBe('allpages');
+    expect(url.searchParams.get('$top')).toBe('7');
+    expect(url.searchParams.get('$skip')).toBe('3');
+  });
+
+  it.each([
+    [{ council: 'N' }, 'Council eq 1'],
+    [{ council: 'S' }, 'Council eq 2'],
+    [{ cantonId: '12' }, 'Canton eq 12'],
+    [{ partyId: '14' }, 'PartyNumber eq 14'],
+    [{ groupId: '2' }, 'ParlGroupNumber eq 2'],
+    [
+      { query: "D'Essai" },
+      "(substringof('D''Essai',FirstName) or substringof('D''Essai',LastName) or substringof('D''Essai',MembersCouncil/OfficialName))",
+    ],
+  ] as const)('filters %o on the membership’s own recorded fields', async (filter, predicate) => {
+    http = parliamentHttp(() =>
+      Response.json({ d: { results: [historyRosterRow()], __count: '1' } }),
+    );
+    await search({ committeeId: '12', asOf: '2014-03-03', ...filter });
+    expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$filter')).toBe(
+      `Language eq 'DE' and (${onDay} and ${predicate})`,
+    );
+  });
+
+  it('maps the period affiliation from the history row and only identity from the expansion', async () => {
+    http = parliamentHttp(() =>
+      Response.json({
+        d: {
+          results: [
+            historyRosterRow(),
+            historyRosterRow(
+              {
+                ID: memberGuid(2),
+                PersonNumber: 92,
+                FirstName: null,
+                CommitteeFunction: null,
+                CommitteeFunctionName: '',
+                DateLeaving: null,
+                PartyNumber: null,
+                PartyName: null,
+                PartyAbbreviation: null,
+                ParlGroupNumber: null,
+              },
+              { ID: 802, PersonNumber: 92, OfficialName: null },
+            ),
+          ],
+          __count: '2',
+        },
+      }),
+    );
+    const page = await search({ committeeId: '12', asOf: '2014-03-03' });
+    expect(page).toMatchObject({ totalCount: 2, hasMore: false, committeeFound: true });
+    expect(page.items[0]).toEqual({
+      memberCouncilId: '801',
+      personNumber: '91',
+      metadataLanguage: 'de',
+      sourceUrl:
+        "https://ws.parlament.ch/odata.svc/MemberCommitteeHistory(ID=guid'00000000-0000-4000-8000-000000000001',Language='DE')",
+      firstName: 'Zoë',
+      lastName: "D'Essai",
+      officialName: "Zoë D'Essai",
+      councilId: '1',
+      councilName: 'Nationalrat',
+      councilAbbreviation: 'NR',
+      cantonId: '7',
+      cantonName: 'Canton synthétique',
+      cantonAbbreviation: 'SY',
+      partyId: '14',
+      partyName: 'Parti historique',
+      partyAbbreviation: 'PHIS',
+      groupId: '3',
+      groupName: 'Groupe historique',
+      groupAbbreviation: 'Fraktion CE',
+      committeeFunctionId: 1,
+      committeeFunctionName: 'Mitglied',
+      committeeJoinedDate: '2011-12-15T00:00:00.000',
+      committeeLeftDate: '2014-03-09T00:00:00.000',
+    });
+    expect(page.items[1]).toEqual({
+      memberCouncilId: '802',
+      personNumber: '92',
+      metadataLanguage: 'de',
+      sourceUrl:
+        "https://ws.parlament.ch/odata.svc/MemberCommitteeHistory(ID=guid'00000000-0000-4000-8000-000000000002',Language='DE')",
+      lastName: "D'Essai",
+      councilId: '1',
+      councilName: 'Nationalrat',
+      councilAbbreviation: 'NR',
+      cantonId: '7',
+      cantonName: 'Canton synthétique',
+      cantonAbbreviation: 'SY',
+      groupName: 'Groupe historique',
+      groupAbbreviation: 'Fraktion CE',
+      committeeFunctionName: '',
+      committeeJoinedDate: '2011-12-15T00:00:00.000',
+    });
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it.each([
+    ['a missing expansion', historyRosterRow({ MembersCouncil: undefined })],
+    ['a null expansion', historyRosterRow({ MembersCouncil: null })],
+    [
+      'a deferred expansion',
+      historyRosterRow({
+        MembersCouncil: { __deferred: { uri: 'https://ws.parlament.ch/odata.svc/x' } },
+      }),
+    ],
+    ['an other-language expansion', historyRosterRow({}, { Language: 'FR' })],
+    ['an other-language membership', historyRosterRow({ Language: 'IT' })],
+    ['an expansion without its ID', historyRosterRow({}, { ID: undefined })],
+  ])('fails %s as a serialization error without a Committee read', async (_label, row) => {
+    http = parliamentHttp(() => Response.json({ d: { results: [row], __count: '1' } }));
+    await expect(search({ committeeId: '12', asOf: '2014-03-03' })).rejects.toMatchObject({
+      code: JsonRpcErrorCode.SerializationError,
+    });
+    expect(http.calls.map((call) => new URL(call.request.url).pathname)).toEqual([
+      '/odata.svc/MemberCommitteeHistory',
+    ]);
+  });
+
+  it.each([
+    ['an existing committee before its published history', [{ ID: 12 }], true],
+    ['an unknown committee', [], false],
+  ] as const)(
+    'reads Committee by CommitteeNumber once for %s',
+    async (_label, committees, found) => {
+      http = parliamentHttp((request) =>
+        Response.json(
+          new URL(request.url).pathname === '/odata.svc/Committee'
+            ? { d: committees }
+            : { d: { results: [], __count: '0' } },
+        ),
+      );
+      const page = await search({ committeeId: '12', asOf: '1995-12-03' });
+      expect(page).toMatchObject({ items: [], totalCount: 0, committeeFound: found });
+      expect(http.calls.map((call) => new URL(call.request.url).pathname)).toEqual([
+        '/odata.svc/MemberCommitteeHistory',
+        '/odata.svc/Committee',
+      ]);
+    },
+  );
+
+  it('fills a page across a source continuation that keeps the expansion', async () => {
+    http = parliamentHttp((request) => {
+      const url = new URL(request.url);
+      expect(url.pathname).toBe('/odata.svc/MemberCommitteeHistory');
+      expect(url.searchParams.get('$expand')).toBe('MembersCouncil');
+      if (url.searchParams.get('$skiptoken') === 'history+2')
+        return Response.json({
+          d: {
+            results: [historyRosterRow({ ID: memberGuid(2), PersonNumber: 92 }, { ID: 802 })],
+            __count: '3',
+          },
+        });
+      const next = new URL(url);
+      next.searchParams.set('$skiptoken', 'history+2');
+      return Response.json({
+        d: { results: [historyRosterRow()], __count: '3', __next: next.href },
+      });
+    });
+    const page = await search({ committeeId: '12', asOf: '2014-03-03', limit: 2 });
+    expect(page.items.map((row) => row.memberCouncilId)).toEqual(['801', '802']);
+    expect(page).toMatchObject({
+      totalCount: 3,
+      hasMore: true,
+      nextOffset: 2,
+      committeeFound: true,
+    });
+    expect(http.calls).toHaveLength(2);
+  });
+});
+
+describe('MemberService declared-interest searches', () => {
+  const interestSelect = [
+    'ID',
+    'Language',
+    'PersonNumber',
+    'InterestName',
+    'Agency',
+    'InterestType',
+    'InterestTypeText',
+    'OrganizationType',
+    'OrganizationTypeText',
+    'FunctionInAgency',
+    'FunctionInAgencyText',
+    'Paid',
+    'SortOrder',
+    'Modified',
+    'DateFrom',
+  ];
+  const declarantSelect = [
+    'ID',
+    'Language',
+    'PersonNumber',
+    'FirstName',
+    'LastName',
+    'OfficialName',
+    'Active',
+    'Council',
+    'CouncilName',
+    'CouncilAbbreviation',
+    'Canton',
+    'CantonName',
+    'CantonAbbreviation',
+    'Party',
+    'PartyName',
+    'PartyAbbreviation',
+    'ParlGroupNumber',
+    'ParlGroupName',
+    'ParlGroupAbbreviation',
+    'DateJoining',
+    'DateLeaving',
+  ].map((field) => `Persons/MembersCouncil/${field}`);
+
+  it('pages PersonInterest by InterestName through the declarant’s two-hop MemberCouncil expansion', async () => {
+    http = parliamentHttp(() =>
+      Response.json({ d: { results: [interestSearchRow()], __count: '4' } }),
+    );
+    await search({ interest: "Groupe Mutuel l'", limit: 7, offset: 3 });
+    expect(http.calls).toHaveLength(1);
+    const url = new URL(http.calls[0]?.request.url ?? '');
+    expect(url.pathname).toBe('/odata.svc/PersonInterest');
+    expect(url.searchParams.get('$filter')).toBe(
+      "Language eq 'DE' and (substringof('Groupe Mutuel l''',InterestName) and Persons/MembersCouncil/Active eq true)",
+    );
+    expect(url.searchParams.get('$expand')).toBe('Persons/MembersCouncil');
+    expect(url.searchParams.get('$select')?.split(',')).toEqual([
+      ...interestSelect,
+      ...declarantSelect,
+    ]);
+    expect(url.searchParams.get('$orderby')).toBe(
+      'LastName asc,FirstName asc,PersonNumber asc,SortOrder asc,ID asc',
+    );
+    expect(url.searchParams.get('$inlinecount')).toBe('allpages');
+    expect(url.searchParams.get('$top')).toBe('7');
+    expect(url.searchParams.get('$skip')).toBe('3');
+  });
+
+  it('sends accented interest text to the source unchanged', async () => {
+    http = parliamentHttp(() => Response.json({ d: [] }));
+    await search({ interest: 'Réflexion' });
+    expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$filter')).toBe(
+      "Language eq 'DE' and (substringof('Réflexion',InterestName) and Persons/MembersCouncil/Active eq true)",
+    );
+  });
+
+  it.each([
+    ['current', 'Persons/MembersCouncil/Active eq true'],
+    ['former', 'Persons/MembersCouncil/Active eq false'],
+    ['all', '(Persons/MembersCouncil/Active eq true or Persons/MembersCouncil/Active eq false)'],
+  ] as const)(
+    'keeps membership %s on the declarant’s record and requires one under all',
+    async (membership, predicate) => {
+      http = parliamentHttp(() => Response.json({ d: [] }));
+      await search({ interest: 'Schweiz', membership });
+      expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$filter')).toBe(
+        `Language eq 'DE' and (substringof('Schweiz',InterestName) and ${predicate})`,
+      );
+    },
+  );
+
+  it('conjoins every narrowing filter on the declarant’s record in the MemberCouncil route order', async () => {
+    http = parliamentHttp(() => Response.json({ d: [] }));
+    await search({
+      language: 'fr',
+      interest: 'Groupe',
+      query: "D'Essai",
+      council: 'S',
+      cantonId: '7',
+      partyId: '8',
+      groupId: '9',
+    });
+    expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$filter')).toBe(
+      "Language eq 'FR' and (substringof('Groupe',InterestName) and Persons/MembersCouncil/Active eq true and (substringof('D''Essai',Persons/MembersCouncil/FirstName) or substringof('D''Essai',Persons/MembersCouncil/LastName) or substringof('D''Essai',Persons/MembersCouncil/OfficialName)) and Persons/MembersCouncil/Council eq 2 and Persons/MembersCouncil/Canton eq 7 and Persons/MembersCouncil/Party eq 8 and Persons/MembersCouncil/ParlGroupNumber eq 9)",
+    );
+  });
+
+  it('maps each declaration to the declarant’s MemberCouncil record plus the whole declaration', async () => {
+    http = parliamentHttp(() =>
+      Response.json({
+        d: {
+          results: [
+            interestSearchRow(),
+            interestSearchRow(
+              { ID: memberGuid(3), PersonNumber: 92, Paid: null, Modified: null },
+              { ID: 802, PersonNumber: 92, Active: false, OfficialName: null },
+            ),
+          ],
+          __count: '2',
+        },
+      }),
+    );
+    const page = await search({ interest: 'synthétique', membership: 'all' });
+    expect(page).toMatchObject({ totalCount: 2, hasMore: false });
+    expect(page).not.toHaveProperty('committeeFound');
+    expect(page.items[0]).toEqual({
+      memberCouncilId: '801',
+      personNumber: '91',
+      metadataLanguage: 'de',
+      sourceUrl: "https://ws.parlament.ch/odata.svc/MemberCouncil(ID=801,Language='DE')",
+      firstName: 'Zoë',
+      lastName: "D'Essai",
+      officialName: "Zoë D'Essai",
+      active: true,
+      councilId: '2',
+      councilName: 'Conseil des États',
+      councilAbbreviation: 'S',
+      cantonId: '7',
+      cantonName: 'Canton synthétique',
+      cantonAbbreviation: 'SY',
+      partyId: '8',
+      partyName: 'Parti synthétique',
+      partyAbbreviation: 'PSYN',
+      groupId: '9',
+      groupName: 'Groupe synthétique',
+      groupAbbreviation: 'GSYN',
+      joinedDate: '1970-01-01T01:00:00.000+01:00',
+      interest: {
+        id: memberGuid(2),
+        interestName: 'Association synthétique',
+        agency: '',
+        interestType: 0,
+        interestTypeText: 'Intérêt synthétique',
+        organizationType: 2,
+        organizationTypeText: 'Association',
+        functionInAgency: 3,
+        functionInAgencyText: 'Membre',
+        paid: false,
+        sortOrder: 0,
+        modifiedAt: '1969-12-31T22:30:00.000-01:30',
+        dateFrom: '2023-02-15T00:00:00.000',
+        sourceUrl:
+          "https://ws.parlament.ch/odata.svc/PersonInterest(ID=guid'00000000-0000-4000-8000-000000000002',Language='DE')",
+      },
+    });
+    expect(page.items[1]).toMatchObject({
+      memberCouncilId: '802',
+      personNumber: '92',
+      active: false,
+      interest: { id: memberGuid(3) },
+    });
+    expect(page.items[1]).not.toHaveProperty('officialName');
+    expect(page.items[1]?.interest).not.toHaveProperty('paid');
+    expect(page.items[1]?.interest).not.toHaveProperty('modifiedAt');
+  });
+
+  it.each([
+    ['a missing Person expansion', { ...interestRow() }],
+    ['a null Person expansion', { ...interestRow(), Persons: null }],
+    ['a missing MemberCouncil expansion', { ...interestRow(), Persons: {} }],
+    ['a null MemberCouncil expansion', { ...interestRow(), Persons: { MembersCouncil: null } }],
+    ['an other-language declarant', interestSearchRow({}, { Language: 'FR' })],
+    ['an other-language declaration', interestSearchRow({ Language: 'IT' })],
+    ['a declarant record without its ID', interestSearchRow({}, { ID: undefined })],
+  ])('fails %s as a serialization error', async (_label, row) => {
+    http = parliamentHttp(() => Response.json({ d: { results: [row], __count: '1' } }));
+    await expect(search({ interest: 'Groupe', membership: 'all' })).rejects.toMatchObject({
+      code: JsonRpcErrorCode.SerializationError,
+    });
+    expect(http.calls.map((call) => new URL(call.request.url).pathname)).toEqual([
+      '/odata.svc/PersonInterest',
+    ]);
+  });
+
+  it('fills a page across a source continuation that keeps the two-hop expansion', async () => {
+    http = parliamentHttp((request) => {
+      const url = new URL(request.url);
+      expect(url.pathname).toBe('/odata.svc/PersonInterest');
+      expect(url.searchParams.get('$expand')).toBe('Persons/MembersCouncil');
+      if (url.searchParams.get('$skiptoken') === 'interest+2')
+        return Response.json({
+          d: {
+            results: [interestSearchRow({ ID: memberGuid(3) }, { ID: 802 })],
+            __count: '3',
+          },
+        });
+      const next = new URL(url);
+      next.searchParams.set('$skiptoken', 'interest+2');
+      return Response.json({
+        d: { results: [interestSearchRow()], __count: '3', __next: next.href },
+      });
+    });
+    const page = await search({ interest: 'Groupe', limit: 2 });
+    expect(page.items.map((row) => [row.memberCouncilId, row.interest?.id])).toEqual([
+      ['801', memberGuid(2)],
+      ['802', memberGuid(3)],
+    ]);
+    expect(page).toMatchObject({ totalCount: 3, hasMore: true, nextOffset: 2 });
     expect(http.calls).toHaveLength(2);
   });
 });

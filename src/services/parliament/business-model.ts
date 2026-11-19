@@ -42,6 +42,20 @@ export const BusinessTextFieldSchema = z.enum(
   Object.keys(BUSINESS_TEXT_FIELDS) as (keyof typeof BUSINESS_TEXT_FIELDS)[],
 );
 
+/** Member business roles and their BusinessRole.Role codes; codes 5 and 6 have no source rows. */
+export const BUSINESS_ROLE_CODES = {
+  author: 7,
+  cosignatory: 3,
+  spokesperson: 2,
+  opponent: 1,
+  successor: 4,
+} as const;
+
+/** One member business role accepted by chparl_search_business. */
+export const BusinessRoleSchema = z.enum(
+  Object.keys(BUSINESS_ROLE_CODES) as (keyof typeof BUSINESS_ROLE_CODES)[],
+);
+
 /** Named business sections; every relationship is independently paged. */
 export const BusinessSectionSchema = z.enum([
   'overview',
@@ -217,7 +231,12 @@ export const BusinessOverviewSchema = BusinessSummarySchema.extend({
   firstCouncil1Name: z.string().optional().describe('FirstCouncil1 name from the source.'),
   firstCouncil2Id: z.string().optional().describe('FirstCouncil2 code from the source.'),
   firstCouncil2Name: z.string().optional().describe('FirstCouncil2 name from the source.'),
-  tags: z.string().optional().describe('Original Tags value.'),
+  tags: z
+    .string()
+    .optional()
+    .describe(
+      'Original Tags value: pipe-delimited topic tag IDs, named by chparl_list_reference topic tags and searchable through chparl_search_business tagId.',
+    ),
   tagNames: z.string().optional().describe('Original TagNames value.'),
   category: z.string().optional().describe('Published business category.'),
   availableTextFields: z
@@ -248,6 +267,9 @@ export const BusinessSearchFiltersSchema = z
     statusId: Int32IdSchema.optional().describe('Current status code.'),
     sessionId: Int32IdSchema.optional().describe('Submission session code.'),
     committeeId: Int32IdSchema.optional().describe('Committee role code.'),
+    personNumber: Int32IdSchema.optional().describe('Member PersonNumber holding the roles.'),
+    role: BusinessRoleSchema.optional().describe('One member role.'),
+    tagId: Int32IdSchema.optional().describe('Topic tag ID matched as one whole Tags element.'),
     submittedFrom: z.string().optional().describe('Inclusive submission-date lower bound.'),
     submittedTo: z.string().optional().describe('Inclusive submission-date upper bound.'),
     limit: z

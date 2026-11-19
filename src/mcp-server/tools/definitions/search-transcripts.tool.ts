@@ -11,6 +11,7 @@ import {
   Int32IdSchema,
   Int64IdSchema,
   IsoDaySchema,
+  inclusiveDaySpan,
   LanguageSchema,
   optionalString,
 } from '@/services/parliament/normalization.js';
@@ -30,14 +31,13 @@ import {
 } from '@/services/parliament/transcript-service.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import {
-  COLLECTION_RESULT_LIMIT_BYTES,
   clampNotice,
   completeResultBytes,
   fieldTrailer,
-  fitCollectionPage,
   formatParliamentResult,
   isPastEnd,
   joinNotices,
+  WHOLE_RESULT_NOTICE_BYTES,
 } from '../parliament-format.js';
 
 const OutputSchema = z.object({
@@ -81,15 +81,9 @@ function subjectsOf(transcripts: readonly Transcript[]): string[] {
   ];
 }
 
-/** Entries for the delivered subjects; a delivered prefix keeps the lookup's first-appearance order. */
-function deliveredSubjectBusinesses(
-  transcripts: readonly Transcript[],
-  lookup: SubjectBusinessLookup,
-): Output['subjectBusinesses'] {
-  if (lookup.status === 'unavailable') return undefined;
-  const delivered = new Set(subjectsOf(transcripts));
-  const entries = lookup.entries.filter((entry) => delivered.has(entry.subjectId));
-  return entries.length > 0 ? entries : undefined;
+/** The lookup covers every delivered subject; absent when unavailable or without a subject. */
+function subjectBusinessesOf(lookup: SubjectBusinessLookup): Output['subjectBusinesses'] {
+  return lookup.status === 'resolved' && lookup.entries.length > 0 ? lookup.entries : undefined;
 }
 
 const UNAVAILABLE_LOOKUP = {
@@ -141,13 +135,15 @@ const EnrichmentSchema = z.object({
   notice: z
     .string()
     .optional()
-    .describe('Combined clamp, whole-item fitting, empty-result, or indivisible-record guidance.'),
+    .describe(
+      'Combined clamp, empty-result, past-end, unavailable-lookup, or oversized exact-passage guidance.',
+    ),
 });
 
 /** Read original debate text in both councils through exact passage or bounded search scopes. */
 export const searchTranscriptsTool = tool('chparl_search_transcripts', {
   description:
-    'Find Amtliches Bulletin passages by business, debate subject, speaker, session, council, or inclusive meeting dates. Supply at least a business, subject, speaker, session, or date bound. A text substring query additionally requires sessionId or a closed date range of at most 31 calendar days. Searches return metadata by default; includeText returns whole original passages, and an exact transcriptId defaults to full text. Metadata language never translates the speaker text; missing LanguageOfText remains unknown. Business searches cover every associated subject up to 20; larger debates require selecting subjectId through chparl_get_business section subjects. subjectBusinesses lists the businesses published for each delivered subjectId; pass a subjectBusinesses[].businesses[].businessId to chparl_get_business or chparl_get_votes. Follow nextOffset with unchanged filters.',
+    'Find Amtliches Bulletin passages by business, debate subject, speaker, session, council, or inclusive meeting dates. Supply at least a business, subject, speaker, session, or date bound. A text substring query additionally requires sessionId or a closed date range of at most 31 calendar days. Searches return metadata by default; includeText returns whole original passages, and an exact transcriptId defaults to full text. Metadata language never translates the speaker text; missing LanguageOfText remains unknown. Business searches cover every associated subject up to 20; a business with more is searched when council, sessionId, or date bounds leave at most 20 of its subjects, and otherwise requires selecting subjectId through chparl_get_business section subjects. subjectBusinesses lists the businesses published for each delivered subjectId; pass a subjectBusinesses[].businesses[].businessId to chparl_get_business or chparl_get_votes. Searches run in debate order, oldest first: meeting day, sitting, debate subject, then speaking order (sortOrder) within the subject. Follow nextOffset with unchanged filters.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     language: LanguageSchema.describe(
@@ -163,7 +159,7 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
       'Exact positive Int64 transcriptId from a previous chparl_search_transcripts result; only language and includeText may accompany it.',
     ),
     personNumber: optionalString(Int32IdSchema).describe(
-      'Exact speaker PersonNumber from chparl_search_members, distinct from Person.ID.',
+      'Exact speaker PersonNumber from chparl_search_members.',
     ),
     sessionId: optionalString(Int32IdSchema).describe(
       'Exact positive decimal session identifier from chparl_list_reference topic sessions.',
@@ -225,9 +221,9 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
       reason: 'business_scope_too_broad',
       code: JsonRpcErrorCode.ValidationError,
       thrownBy: 'service',
-      when: 'A business has more than 20 associated debate subjects.',
+      when: 'A business has more than 20 associated debate subjects, and council, sessionId, dateFrom, and dateTo, when supplied, leave more than 20 of them.',
       recovery:
-        'Page chparl_get_business with section subjects, then call chparl_search_transcripts with one subjectId.',
+        'Narrow chparl_search_transcripts by council, sessionId, or a narrower date range; otherwise page chparl_get_business with section subjects, then call chparl_search_transcripts with one subjectId.',
     },
     {
       reason: 'incompatible_fields',
@@ -286,12 +282,10 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
         },
       });
     if (input.query !== undefined && input.sessionId === undefined) {
-      const closedRange = input.dateFrom !== undefined && input.dateTo !== undefined;
-      const days = closedRange
-        ? (Date.parse(`${input.dateTo}T00:00:00Z`) - Date.parse(`${input.dateFrom}T00:00:00Z`)) /
-            86_400_000 +
-          1
-        : undefined;
+      const days =
+        input.dateFrom !== undefined && input.dateTo !== undefined
+          ? inclusiveDaySpan(input.dateFrom, input.dateTo)
+          : undefined;
       if (days === undefined || days > 31) throw ctx.fail('text_scope_required');
     }
     if (
@@ -334,7 +328,7 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
           input.language,
           workflow,
         );
-        const subjectBusinesses = deliveredSubjectBusinesses(transcripts, lookup);
+        const subjectBusinesses = subjectBusinessesOf(lookup);
         const output: Output = {
           found: passage !== undefined,
           transcripts,
@@ -350,7 +344,7 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
           completeResultBytes(output, {
             effectiveFilters: filters,
             ...(unavailable !== undefined && { notice: unavailable }),
-          }) >= COLLECTION_RESULT_LIMIT_BYTES;
+          }) >= WHOLE_RESULT_NOTICE_BYTES;
         const notice = joinNotices(
           oversized &&
             `This indivisible passage, its subject businesses, or its provenance exceeds 24000 bytes and is returned whole. Retrieve it with chparl_search_transcripts arguments ${JSON.stringify({ transcriptId: input.transcriptId, language: input.language, includeText })}.`,
@@ -360,68 +354,44 @@ export const searchTranscriptsTool = tool('chparl_search_transcripts', {
         return output;
       }
 
-      const result = await searchTranscripts(filters, paging, workflow);
-      /** Fit a prefix of the fetched passages; a shorter `items` is itself a byte-fitting cut. */
-      const preparePage = (items: readonly Transcript[], lookup: SubjectBusinessLookup) => {
-        const unavailable = lookupNotice(lookup);
-        return fitCollectionPage(items, (transcripts, fittedCut, oversized) => {
-          const cut = fittedCut || items.length < result.items.length;
-          const hasMore = transcripts.length > 0 && (cut || result.hasMore);
-          const subjectBusinesses = deliveredSubjectBusinesses(transcripts, lookup);
-          const notice = joinNotices(
-            clampNotice(requestedLimit, paging.limit),
-            cut &&
-              'Response byte fitting returned fewer whole passages. Continue with nextOffset; no original fields were shortened.',
-            transcripts.length === 0 &&
-              result.scopeFound !== false &&
-              (result.noSubjects
-                ? 'This business has no published debate subjects. Use another chparl_get_business section or chparl_search_transcripts with a session or speaker filter.'
-                : isPastEnd(result.totalCount, paging.offset)
-                  ? 'The requested offset is past the last matching passage. Retry chparl_search_transcripts with the same filters and offset:0.'
-                  : 'No Bulletin passages matched these filters. Use chparl_get_business with section subjects, or chparl_list_reference with topic sessions, then retry chparl_search_transcripts.'),
-            oversized &&
-              `One indivisible passage, its subject businesses, or its provenance exceeds 24000 bytes and is returned whole. Retrieve this page with chparl_search_transcripts arguments ${JSON.stringify({ ...filters, offset: paging.offset, limit: 1 })}.`,
-            unavailable,
-          );
-          return {
-            output: {
-              transcripts,
-              ...(subjectBusinesses && { subjectBusinesses }),
-              ...(result.scopeFound !== undefined && { scopeFound: result.scopeFound }),
-              ...(result.scopeFound === false && {
-                guidance:
-                  'No business matched this identifier. Use chparl_search_business to discover a valid businessId.',
-              }),
-              provenance: provenance(workflow.sources),
-            },
-            enrichment: {
-              effectiveFilters: filters,
-              returnedCount: transcripts.length,
-              effectiveLimit: paging.limit,
-              ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
-              hasMore,
-              ...(hasMore && { nextOffset: paging.offset + transcripts.length }),
-              ...(notice !== undefined && { notice }),
-            },
-          };
-        });
+      const { items: transcripts, ...result } = await searchTranscripts(filters, paging, workflow);
+      const lookup = await resolveSubjectBusinesses(
+        subjectsOf(transcripts),
+        filters.language,
+        workflow,
+      );
+      const subjectBusinesses = subjectBusinessesOf(lookup);
+      const hasMore = transcripts.length > 0 && result.hasMore;
+      const notice = joinNotices(
+        clampNotice(requestedLimit, paging.limit),
+        transcripts.length === 0 &&
+          result.scopeFound !== false &&
+          (result.noSubjects
+            ? 'This business has no published debate subjects. Use another chparl_get_business section or chparl_search_transcripts with a session or speaker filter.'
+            : isPastEnd(result.totalCount, paging.offset)
+              ? 'The requested offset is past the last matching passage. Retry chparl_search_transcripts with the same filters and offset:0.'
+              : 'No Bulletin passages matched these filters. Use chparl_get_business with section subjects, or chparl_list_reference with topic sessions, then retry chparl_search_transcripts.'),
+        lookupNotice(lookup),
+      );
+      ctx.enrich({
+        effectiveFilters: filters,
+        returnedCount: transcripts.length,
+        effectiveLimit: paging.limit,
+        ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
+        hasMore,
+        ...(hasMore && { nextOffset: paging.offset + transcripts.length }),
+        ...(notice !== undefined && { notice }),
+      });
+      return {
+        transcripts,
+        ...(subjectBusinesses && { subjectBusinesses }),
+        ...(result.scopeFound !== undefined && { scopeFound: result.scopeFound }),
+        ...(result.scopeFound === false && {
+          guidance:
+            'No business matched this identifier. Use chparl_search_business to discover a valid businessId.',
+        }),
+        provenance: provenance(workflow.sources),
       };
-      /**
-       * Fit before resolving: lookup URLs land in the measured provenance, so resolving every fetched
-       * subject would spend the budget on passages the page cannot deliver. The page fitted without
-       * the lookup bounds the candidates; the final fit measures their subject list, its provenance,
-       * and any notice, and can only deliver the same or fewer.
-       */
-      const candidates = result.items.slice(
-        0,
-        preparePage(result.items, { status: 'resolved', entries: [] }).output.transcripts.length,
-      );
-      const prepared = preparePage(
-        candidates,
-        await resolveSubjectBusinesses(subjectsOf(candidates), filters.language, workflow),
-      );
-      ctx.enrich(prepared.enrichment);
-      return prepared.output;
     });
   },
   format: formatParliamentResult,

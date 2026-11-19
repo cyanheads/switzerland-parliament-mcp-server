@@ -60,7 +60,12 @@ export const HISTORY_VOTING_FIELDS = [
   'BusinessNumber',
   'BusinessShortNumber',
   'BusinessTitle',
+  'BillTitle',
+  'RegistrationNumber',
   'IdSession',
+  'Subject',
+  'MeaningYes',
+  'MeaningNo',
   'VoteEnd',
   'VoteEndWithTimezone',
 ] as const;
@@ -96,7 +101,12 @@ export const RawVotingSchema = z.object({
   BusinessNumber: RawInt32,
   BusinessShortNumber: RawText,
   BusinessTitle: RawText,
+  BillTitle: RawText,
+  RegistrationNumber: RawInt32,
   IdSession: RawInt32,
+  Subject: RawText,
+  MeaningYes: RawText,
+  MeaningNo: RawText,
   VoteEnd: RawDate,
   VoteEndWithTimezone: RawDate,
   PersonNumber: RawInt32,
@@ -175,10 +185,33 @@ export const MemberDecisionSchema = z
       .string()
       .optional()
       .describe('History only: published business title on the Voting row.'),
+    billTitle: z
+      .string()
+      .optional()
+      .describe('History only: published bill title on the Voting row.'),
+    registrationNumber: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'History only: published roll-call registration number; a chparl_search_transcripts vote passage carries it as its voteId.',
+      ),
     sessionId: z
       .string()
       .optional()
       .describe('History only: published IdSession on the Voting row.'),
+    subject: z
+      .string()
+      .optional()
+      .describe('History only: original roll-call subject on the Voting row.'),
+    meaningYes: z
+      .string()
+      .optional()
+      .describe('History only: original meaning of a yes decision on this roll call.'),
+    meaningNo: z
+      .string()
+      .optional()
+      .describe('History only: original meaning of a no decision on this roll call.'),
     endTime: z
       .string()
       .optional()
@@ -188,7 +221,7 @@ export const MemberDecisionSchema = z
     personNumber: z
       .string()
       .optional()
-      .describe('Published PersonNumber, distinct from Person.ID.'),
+      .describe('Published PersonNumber, the key chparl_get_member takes.'),
     firstName: z.string().optional().describe('Published member first name.'),
     lastName: z.string().optional().describe('Published member last name.'),
     cantonId: z
@@ -329,7 +362,12 @@ export function normalizeMemberDecision(
       ...(raw.BusinessNumber != null && { businessId: String(raw.BusinessNumber) }),
       ...(raw.BusinessShortNumber != null && { businessShortNumber: raw.BusinessShortNumber }),
       ...(raw.BusinessTitle != null && { businessTitle: raw.BusinessTitle }),
+      ...(raw.BillTitle != null && { billTitle: raw.BillTitle }),
+      ...(raw.RegistrationNumber != null && { registrationNumber: raw.RegistrationNumber }),
       ...(raw.IdSession != null && { sessionId: String(raw.IdSession) }),
+      ...(raw.Subject != null && { subject: raw.Subject }),
+      ...(raw.MeaningYes != null && { meaningYes: raw.MeaningYes }),
+      ...(raw.MeaningNo != null && { meaningNo: raw.MeaningNo }),
       ...(endTime != null && { endTime }),
     }),
     ...(raw.PersonNumber != null && { personNumber: String(raw.PersonNumber) }),

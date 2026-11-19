@@ -76,6 +76,31 @@ export function committeeRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * Synthetic closed MemberCommitteeHistory membership as one member's committee_history section
+ * selects it: committee fields without a committee type, the recorded council, and both dates.
+ */
+export function committeeHistoryRow(overrides: Record<string, unknown> = {}) {
+  return {
+    ID: memberGuid(5),
+    PersonNumber: 91,
+    Language: 'DE',
+    CommitteeNumber: 10,
+    CommitteeName: 'Commission historique',
+    Abbreviation: 'CH-NR',
+    Abbreviation1: 'CH-N',
+    Abbreviation2: '',
+    Council: 1,
+    CouncilName: 'Nationalrat',
+    CouncilAbbreviation: 'NR',
+    CommitteeFunction: 0,
+    CommitteeFunctionName: 'Mitglied',
+    DateJoining: '/Date(1323907200000)/',
+    DateLeaving: '/Date(1448755200000)/',
+    ...overrides,
+  };
+}
+
 /** Synthetic MemberCommittee membership with its expanded, active MemberCouncil record. */
 export function rosterRow(
   overrides: Record<string, unknown> = {},
@@ -87,6 +112,52 @@ export function rosterRow(
     CommitteeFunction: 1,
     CommitteeFunctionName: 'Mitglied',
     MembersCouncil: memberRow({ Active: true, Council: 1, DateLeaving: null, ...memberOverrides }),
+    ...overrides,
+  };
+}
+
+/**
+ * Synthetic MemberCommitteeHistory row: period affiliation on the row itself, and a MemberCouncil
+ * expansion whose latest-record affiliation deliberately differs (council 99, party 1586, no group).
+ */
+export function historyRosterRow(
+  overrides: Record<string, unknown> = {},
+  memberOverrides: Record<string, unknown> = {},
+) {
+  return {
+    ID: memberGuid(1),
+    Language: 'DE',
+    PersonNumber: 91,
+    FirstName: 'Zoë',
+    LastName: "D'Essai",
+    CommitteeFunction: 1,
+    CommitteeFunctionName: 'Mitglied',
+    DateJoining: '/Date(1323907200000)/',
+    DateLeaving: '/Date(1394323200000)/',
+    Council: 1,
+    CouncilName: 'Nationalrat',
+    CouncilAbbreviation: 'NR',
+    Canton: 7,
+    CantonName: 'Canton synthétique',
+    CantonAbbreviation: 'SY',
+    PartyNumber: 14,
+    PartyName: 'Parti historique',
+    PartyAbbreviation: 'PHIS',
+    ParlGroupNumber: 3,
+    ParlGroupName: 'Groupe historique',
+    ParlGroupAbbreviation: 'Fraktion CE',
+    MembersCouncil: memberRow({
+      Council: 99,
+      CouncilName: 'Bundesrat',
+      CouncilAbbreviation: 'BR',
+      Party: 1586,
+      PartyName: 'Parti actuel',
+      PartyAbbreviation: 'PACT',
+      ParlGroupNumber: null,
+      ParlGroupName: null,
+      ParlGroupAbbreviation: null,
+      ...memberOverrides,
+    }),
     ...overrides,
   };
 }
@@ -108,7 +179,19 @@ export function interestRow(overrides: Record<string, unknown> = {}) {
     Paid: false,
     SortOrder: 0,
     Modified: '/Date(0-0090)/',
+    DateFrom: '/Date(1676419200000)/',
     ...overrides,
+  };
+}
+
+/** Synthetic declaration with its declarant's expanded, active MemberCouncil record. */
+export function interestSearchRow(
+  overrides: Record<string, unknown> = {},
+  memberOverrides: Record<string, unknown> = {},
+) {
+  return {
+    ...interestRow(overrides),
+    Persons: { MembersCouncil: memberRow({ Active: true, DateLeaving: null, ...memberOverrides }) },
   };
 }
 

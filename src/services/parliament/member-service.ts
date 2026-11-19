@@ -5,9 +5,15 @@
 
 import { z } from '@cyanheads/mcp-ts-core';
 import { serializationError } from '@cyanheads/mcp-ts-core/errors';
-import type { MemberSearchFilters, MemberSearchRow, MemberSummary } from './member-model.js';
+import type {
+  MemberInterest,
+  MemberSearchFilters,
+  MemberSearchRow,
+  MemberSummary,
+} from './member-model.js';
 import {
   type Language,
+  odataDay,
   odataInt32,
   odataString,
   RawDate,
@@ -78,6 +84,16 @@ const RawCommitteeSchema = z.object({
   CommitteeFunction: RawInt32,
   CommitteeFunctionName: RawText,
 });
+/**
+ * One of a person's own MemberCommitteeHistory rows: the MemberCommittee fields without the
+ * committee type, plus the membership's dates (DateLeaving is its last day). A few published rows
+ * name no committee, function, or dates.
+ */
+const RawCommitteeHistorySchema = RawCommitteeSchema.omit({
+  CommitteeType: true,
+  CommitteeTypeName: true,
+  CommitteeTypeAbbreviation: true,
+}).extend({ CommitteeNumber: RawId.nullish(), DateJoining: RawDate, DateLeaving: RawDate });
 const RawInterestSchema = z.object({
   ID: z.uuid(),
   Language: RawLanguage,
@@ -93,6 +109,7 @@ const RawInterestSchema = z.object({
   Paid: z.boolean().nullish(),
   SortOrder: RawInt32,
   Modified: RawDate,
+  DateFrom: RawDate,
 });
 /** One MemberCommittee membership with its singular, non-optional MemberCouncil expansion. */
 const RawRosterSchema = z.object({
@@ -102,27 +119,93 @@ const RawRosterSchema = z.object({
   CommitteeFunctionName: RawText,
   MembersCouncil: RawMemberSchema,
 });
+/**
+ * One MemberCommitteeHistory membership. Its names, council, canton, party (`PartyNumber`), and
+ * group are recorded for that membership; DateJoining/DateLeaving are committee dates, DateLeaving
+ * the last day. The expansion holds the person's latest MemberCouncil record, so only its key and
+ * official name are read.
+ */
+const RawHistoryRosterSchema = z.object({
+  ID: z.uuid(),
+  Language: RawLanguage,
+  PersonNumber: RawId,
+  FirstName: RawText,
+  LastName: RawText,
+  CommitteeFunction: RawInt32,
+  CommitteeFunctionName: RawText,
+  DateJoining: RawDate,
+  DateLeaving: RawDate,
+  Council: RawId.nullish(),
+  CouncilName: RawText,
+  CouncilAbbreviation: RawText,
+  Canton: RawId.nullish(),
+  CantonName: RawText,
+  CantonAbbreviation: RawText,
+  PartyNumber: RawId.nullish(),
+  PartyName: RawText,
+  PartyAbbreviation: RawText,
+  ParlGroupNumber: RawId.nullish(),
+  ParlGroupName: RawText,
+  ParlGroupAbbreviation: RawText,
+  MembersCouncil: z.object({ ID: RawId, Language: RawLanguage, OfficialName: RawText }),
+});
+/** One declaration with its declarant's MemberCouncil record, reached through Person. */
+const RawInterestSearchSchema = RawInterestSchema.extend({
+  Persons: z.object({ MembersCouncil: RawMemberSchema }),
+});
 const affiliationSelect = Object.keys(RawAffiliationSchema.shape);
 const memberSelect = ['ID', ...affiliationSelect];
+const interestSelect = Object.keys(RawInterestSchema.shape);
 
 /** A member-search page; committee searches also report whether the committee exists. */
 export interface MemberSearchPage extends ODataPage<MemberSearchRow> {
   readonly committeeFound?: boolean;
 }
 
-/** Name, council, canton, party, and group predicates over MemberCouncil fields reached through `path`. */
-function narrowingPredicates(filters: MemberSearchFilters, path: '' | 'MembersCouncil/'): string[] {
+/** The source field each narrowing filter reads on one route. */
+interface NarrowingFields {
+  readonly canton: string;
+  readonly council: string;
+  readonly group: string;
+  readonly names: readonly [string, string, string];
+  readonly party: string;
+}
+
+/** MemberCouncil fields reached through `path`: the record itself, or a singular expansion. */
+function memberCouncilFields(
+  path: '' | 'MembersCouncil/' | 'Persons/MembersCouncil/',
+): NarrowingFields {
+  return {
+    names: [`${path}FirstName`, `${path}LastName`, `${path}OfficialName`],
+    council: `${path}Council`,
+    canton: `${path}Canton`,
+    party: `${path}Party`,
+    group: `${path}ParlGroupNumber`,
+  };
+}
+
+/** A history membership's own recorded fields; only the official name comes from the expansion. */
+const historyFields: NarrowingFields = {
+  names: ['FirstName', 'LastName', 'MembersCouncil/OfficialName'],
+  council: 'Council',
+  canton: 'Canton',
+  party: 'PartyNumber',
+  group: 'ParlGroupNumber',
+};
+
+/** Name, council, canton, party, and group predicates, in one order on every route. */
+function narrowingPredicates(filters: MemberSearchFilters, fields: NarrowingFields): string[] {
   const predicates: string[] = [];
   if (filters.query !== undefined) {
     const query = odataString(filters.query);
     predicates.push(
-      `(substringof(${query},${path}FirstName) or substringof(${query},${path}LastName) or substringof(${query},${path}OfficialName))`,
+      `(${fields.names.map((field) => `substringof(${query},${field})`).join(' or ')})`,
     );
   }
-  if (filters.council) predicates.push(`${path}Council eq ${filters.council === 'N' ? 1 : 2}`);
-  if (filters.cantonId) predicates.push(`${path}Canton eq ${odataInt32(filters.cantonId)}`);
-  if (filters.partyId) predicates.push(`${path}Party eq ${odataInt32(filters.partyId)}`);
-  if (filters.groupId) predicates.push(`${path}ParlGroupNumber eq ${odataInt32(filters.groupId)}`);
+  if (filters.council) predicates.push(`${fields.council} eq ${filters.council === 'N' ? 1 : 2}`);
+  if (filters.cantonId) predicates.push(`${fields.canton} eq ${odataInt32(filters.cantonId)}`);
+  if (filters.partyId) predicates.push(`${fields.party} eq ${odataInt32(filters.partyId)}`);
+  if (filters.groupId) predicates.push(`${fields.group} eq ${odataInt32(filters.groupId)}`);
   return predicates;
 }
 
@@ -177,24 +260,66 @@ function member(raw: z.infer<typeof RawMemberSchema>, language: Language): Membe
   };
 }
 
+/** Committee, recorded council, and function fields of a member's current and past rows. */
+function committeeMembership(raw: z.infer<typeof RawCommitteeHistorySchema>) {
+  return {
+    ...(raw.CommitteeName != null && { committeeName: raw.CommitteeName }),
+    ...(raw.Abbreviation != null && { abbreviation: raw.Abbreviation }),
+    ...(raw.Abbreviation1 != null && { abbreviation1: raw.Abbreviation1 }),
+    ...(raw.Abbreviation2 != null && { abbreviation2: raw.Abbreviation2 }),
+    ...(raw.Council != null && { councilId: String(raw.Council) }),
+    ...(raw.CouncilName != null && { councilName: raw.CouncilName }),
+    ...(raw.CouncilAbbreviation != null && { councilAbbreviation: raw.CouncilAbbreviation }),
+    ...(raw.CommitteeFunction != null && { functionId: raw.CommitteeFunction }),
+    ...(raw.CommitteeFunctionName != null && { functionName: raw.CommitteeFunctionName }),
+  };
+}
+
+/** One declaration; an absent/null Paid value remains absent, and false remains false. */
+function interest(raw: z.infer<typeof RawInterestSchema>, language: Language): MemberInterest {
+  verifyLanguage(raw, language);
+  return {
+    id: raw.ID,
+    sourceUrl: sourceUrl('PersonInterest', raw.ID, language),
+    ...(raw.InterestName != null && { interestName: raw.InterestName }),
+    ...(raw.Agency != null && { agency: raw.Agency }),
+    ...(raw.InterestType != null && { interestType: raw.InterestType }),
+    ...(raw.InterestTypeText != null && { interestTypeText: raw.InterestTypeText }),
+    ...(raw.OrganizationType != null && { organizationType: raw.OrganizationType }),
+    ...(raw.OrganizationTypeText != null && { organizationTypeText: raw.OrganizationTypeText }),
+    ...(raw.FunctionInAgency != null && { functionInAgency: raw.FunctionInAgency }),
+    ...(raw.FunctionInAgencyText != null && { functionInAgencyText: raw.FunctionInAgencyText }),
+    ...(raw.Paid != null && { paid: raw.Paid }),
+    ...(raw.SortOrder != null && { sortOrder: raw.SortOrder }),
+    ...(raw.Modified != null && { modifiedAt: raw.Modified }),
+    ...(raw.DateFrom != null && { dateFrom: raw.DateFrom }),
+  };
+}
+
 /** Stateless member workflows, with one explicit context shared across every source page. */
 export class MemberService {
   readonly #client = new ODataClient();
 
   /**
    * Search affiliation records, preserving the current/former/all distinction upstream. With a
-   * committeeId, page that committee's current MemberCommittee memberships instead; the caller
-   * rejects membership former/all, which this source cannot answer.
+   * committeeId, page that committee's MemberCommittee memberships instead, or with asOf its
+   * MemberCommitteeHistory memberships open on that day; the caller rejects membership former/all
+   * on rosters, which these sources cannot answer. With an interest, page matching declarations;
+   * the caller rejects it beside committeeId or asOf.
    */
   async searchMembers(
     filters: MemberSearchFilters,
     workflow: WorkflowContext,
   ): Promise<MemberSearchPage> {
+    if (filters.interest !== undefined)
+      return this.#interestSearch(filters.interest, filters, workflow);
     if (filters.committeeId !== undefined)
-      return this.#committeeRoster(filters.committeeId, filters, workflow);
+      return filters.asOf === undefined
+        ? this.#committeeRoster(filters.committeeId, filters, workflow)
+        : this.#historyRoster(filters.committeeId, filters.asOf, filters, workflow);
     const predicates = [
       ...(filters.membership === 'all' ? [] : [`Active eq ${filters.membership === 'current'}`]),
-      ...narrowingPredicates(filters, ''),
+      ...narrowingPredicates(filters, memberCouncilFields('')),
     ];
     const page = await this.#client.collection(
       {
@@ -224,7 +349,7 @@ export class MemberService {
         // CommitteeNumber leads, so every MembersCouncil/ navigation predicate stays scoped to one roster.
         filter: [
           `CommitteeNumber eq ${odataInt32(committeeId)}`,
-          ...narrowingPredicates(filters, 'MembersCouncil/'),
+          ...narrowingPredicates(filters, memberCouncilFields('MembersCouncil/')),
         ].join(' and '),
         expand: ['MembersCouncil'],
         select: [
@@ -250,14 +375,145 @@ export class MemberService {
         }),
       };
     });
-    // An empty roster and an unknown committee answer identically; only then read Committee.
-    const knownNonEmpty =
-      items.length > 0 || (page.totalCount !== undefined && page.totalCount > 0);
+    return this.#withCommitteeFound({ ...page, items }, committeeId, filters.language, workflow);
+  }
+
+  /**
+   * One membership open on `asOf` per row, ordered by the history row's own names and GUID. A
+   * person holds two rows on a day their function changed: DateLeaving is the last day of one row
+   * and the next row joins that day.
+   */
+  async #historyRoster(
+    committeeId: string,
+    asOf: string,
+    filters: MemberSearchFilters,
+    workflow: WorkflowContext,
+  ): Promise<MemberSearchPage> {
+    const page = await this.#client.collection(
+      {
+        entity: 'MemberCommitteeHistory',
+        language: filters.language,
+        filter: [
+          `CommitteeNumber eq ${odataInt32(committeeId)}`,
+          `DateJoining le ${odataDay(asOf, 'end')}`,
+          `(DateLeaving ge ${odataDay(asOf)} or DateLeaving eq null)`,
+          ...narrowingPredicates(filters, historyFields),
+        ].join(' and '),
+        expand: ['MembersCouncil'],
+        select: [
+          ...Object.keys(RawHistoryRosterSchema.shape).filter(
+            (field) => field !== 'MembersCouncil',
+          ),
+          'MembersCouncil/ID',
+          'MembersCouncil/Language',
+          'MembersCouncil/OfficialName',
+        ],
+        orderBy: searchOrder,
+      },
+      RawHistoryRosterSchema,
+      filters,
+      workflow,
+    );
+    const items = page.items.map((raw): MemberSearchRow => {
+      verifyLanguage(raw, filters.language);
+      verifyLanguage(raw.MembersCouncil, filters.language);
+      return {
+        memberCouncilId: String(raw.MembersCouncil.ID),
+        personNumber: String(raw.PersonNumber),
+        metadataLanguage: filters.language,
+        sourceUrl: sourceUrl('MemberCommitteeHistory', raw.ID, filters.language),
+        ...(raw.FirstName != null && { firstName: raw.FirstName }),
+        ...(raw.LastName != null && { lastName: raw.LastName }),
+        ...(raw.MembersCouncil.OfficialName != null && {
+          officialName: raw.MembersCouncil.OfficialName,
+        }),
+        ...(raw.Council != null && { councilId: String(raw.Council) }),
+        ...(raw.CouncilName != null && { councilName: raw.CouncilName }),
+        ...(raw.CouncilAbbreviation != null && { councilAbbreviation: raw.CouncilAbbreviation }),
+        ...(raw.Canton != null && { cantonId: String(raw.Canton) }),
+        ...(raw.CantonName != null && { cantonName: raw.CantonName }),
+        ...(raw.CantonAbbreviation != null && { cantonAbbreviation: raw.CantonAbbreviation }),
+        ...(raw.PartyNumber != null && { partyId: String(raw.PartyNumber) }),
+        ...(raw.PartyName != null && { partyName: raw.PartyName }),
+        ...(raw.PartyAbbreviation != null && { partyAbbreviation: raw.PartyAbbreviation }),
+        ...(raw.ParlGroupNumber != null && { groupId: String(raw.ParlGroupNumber) }),
+        ...(raw.ParlGroupName != null && { groupName: raw.ParlGroupName }),
+        ...(raw.ParlGroupAbbreviation != null && { groupAbbreviation: raw.ParlGroupAbbreviation }),
+        ...(raw.CommitteeFunction != null && { committeeFunctionId: raw.CommitteeFunction }),
+        ...(raw.CommitteeFunctionName != null && {
+          committeeFunctionName: raw.CommitteeFunctionName,
+        }),
+        ...(raw.DateJoining != null && { committeeJoinedDate: raw.DateJoining }),
+        ...(raw.DateLeaving != null && { committeeLeftDate: raw.DateLeaving }),
+      };
+    });
+    return this.#withCommitteeFound({ ...page, items }, committeeId, filters.language, workflow);
+  }
+
+  /**
+   * One declaration per row, ordered by the declaration's own names. Every filter reads the
+   * declarant's MemberCouncil record through Person; membership all still requires that record
+   * (Active true or false), so a declarant with no published MemberCouncil record matches no
+   * membership value and every row keeps its memberCouncilId and sourceUrl.
+   */
+  async #interestSearch(
+    interestName: string,
+    filters: MemberSearchFilters,
+    workflow: WorkflowContext,
+  ): Promise<MemberSearchPage> {
+    const active = 'Persons/MembersCouncil/Active';
+    const page = await this.#client.collection(
+      {
+        entity: 'PersonInterest',
+        language: filters.language,
+        filter: [
+          `substringof(${odataString(interestName)},InterestName)`,
+          filters.membership === 'all'
+            ? `(${active} eq true or ${active} eq false)`
+            : `${active} eq ${filters.membership === 'current'}`,
+          ...narrowingPredicates(filters, memberCouncilFields('Persons/MembersCouncil/')),
+        ].join(' and '),
+        expand: ['Persons/MembersCouncil'],
+        select: [
+          ...interestSelect,
+          ...memberSelect.map((field) => `Persons/MembersCouncil/${field}`),
+        ],
+        orderBy: [
+          { field: 'LastName', direction: 'asc' },
+          { field: 'FirstName', direction: 'asc' },
+          { field: 'PersonNumber', direction: 'asc' },
+          { field: 'SortOrder', direction: 'asc' },
+          { field: 'ID', direction: 'asc' },
+        ],
+      },
+      RawInterestSearchSchema,
+      filters,
+      workflow,
+    );
     return {
       ...page,
-      items,
+      items: page.items.map(
+        (raw): MemberSearchRow => ({
+          ...member(raw.Persons.MembersCouncil, filters.language),
+          interest: interest(raw, filters.language),
+        }),
+      ),
+    };
+  }
+
+  /** An empty roster and an unknown committee answer identically; only then read Committee. */
+  async #withCommitteeFound(
+    page: ODataPage<MemberSearchRow>,
+    committeeId: string,
+    language: Language,
+    workflow: WorkflowContext,
+  ): Promise<MemberSearchPage> {
+    const knownNonEmpty =
+      page.items.length > 0 || (page.totalCount !== undefined && page.totalCount > 0);
+    return {
+      ...page,
       committeeFound:
-        knownNonEmpty || (await this.#committeeExists(committeeId, filters.language, workflow)),
+        knownNonEmpty || (await this.#committeeExists(committeeId, language, workflow)),
     };
   }
 
@@ -379,7 +635,7 @@ export class MemberService {
     };
   }
 
-  /** Page the published MemberCommittee collection without claiming a historical ledger. */
+  /** Page the published MemberCommittee collection: the person's current memberships. */
   async committees(
     personNumber: string,
     language: Language,
@@ -409,26 +665,56 @@ export class MemberService {
           id: raw.ID,
           committeeId: String(raw.CommitteeNumber),
           sourceUrl: sourceUrl('MemberCommittee', raw.ID, language),
-          ...(raw.CommitteeName != null && { committeeName: raw.CommitteeName }),
-          ...(raw.Abbreviation != null && { abbreviation: raw.Abbreviation }),
-          ...(raw.Abbreviation1 != null && { abbreviation1: raw.Abbreviation1 }),
-          ...(raw.Abbreviation2 != null && { abbreviation2: raw.Abbreviation2 }),
+          ...committeeMembership(raw),
           ...(raw.CommitteeType != null && { committeeTypeId: String(raw.CommitteeType) }),
           ...(raw.CommitteeTypeName != null && { committeeTypeName: raw.CommitteeTypeName }),
           ...(raw.CommitteeTypeAbbreviation != null && {
             committeeTypeAbbreviation: raw.CommitteeTypeAbbreviation,
           }),
-          ...(raw.Council != null && { councilId: String(raw.Council) }),
-          ...(raw.CouncilName != null && { councilName: raw.CouncilName }),
-          ...(raw.CouncilAbbreviation != null && { councilAbbreviation: raw.CouncilAbbreviation }),
-          ...(raw.CommitteeFunction != null && { functionId: raw.CommitteeFunction }),
-          ...(raw.CommitteeFunctionName != null && { functionName: raw.CommitteeFunctionName }),
         };
       }),
     };
   }
 
-  /** Page declared interests; an absent/null Paid value remains absent, and false remains false. */
+  /** Page every published committee membership of one person, past and current, oldest first. */
+  async committeeHistory(
+    personNumber: string,
+    language: Language,
+    paging: { limit: number; offset: number },
+    workflow: WorkflowContext,
+  ) {
+    const page = await this.#client.collection(
+      {
+        entity: 'MemberCommitteeHistory',
+        language,
+        filter: `PersonNumber eq ${odataInt32(personNumber)}`,
+        select: Object.keys(RawCommitteeHistorySchema.shape),
+        orderBy: [
+          { field: 'DateJoining', direction: 'asc' },
+          { field: 'ID', direction: 'asc' },
+        ],
+      },
+      RawCommitteeHistorySchema,
+      paging,
+      workflow,
+    );
+    return {
+      ...page,
+      items: page.items.map((raw) => {
+        verifyLanguage(raw, language);
+        return {
+          id: raw.ID,
+          ...(raw.CommitteeNumber != null && { committeeId: String(raw.CommitteeNumber) }),
+          sourceUrl: sourceUrl('MemberCommitteeHistory', raw.ID, language),
+          ...committeeMembership(raw),
+          ...(raw.DateJoining != null && { joinedDate: raw.DateJoining }),
+          ...(raw.DateLeaving != null && { leftDate: raw.DateLeaving }),
+        };
+      }),
+    };
+  }
+
+  /** Page one person's declared interests in their source order. */
   async interests(
     personNumber: string,
     language: Language,
@@ -440,7 +726,7 @@ export class MemberService {
         entity: 'PersonInterest',
         language,
         filter: `PersonNumber eq ${odataInt32(personNumber)}`,
-        select: Object.keys(RawInterestSchema.shape),
+        select: interestSelect,
         orderBy: [
           { field: 'SortOrder', direction: 'asc' },
           { field: 'ID', direction: 'asc' },
@@ -450,30 +736,6 @@ export class MemberService {
       paging,
       workflow,
     );
-    return {
-      ...page,
-      items: page.items.map((raw) => {
-        verifyLanguage(raw, language);
-        return {
-          id: raw.ID,
-          sourceUrl: sourceUrl('PersonInterest', raw.ID, language),
-          ...(raw.InterestName != null && { interestName: raw.InterestName }),
-          ...(raw.Agency != null && { agency: raw.Agency }),
-          ...(raw.InterestType != null && { interestType: raw.InterestType }),
-          ...(raw.InterestTypeText != null && { interestTypeText: raw.InterestTypeText }),
-          ...(raw.OrganizationType != null && { organizationType: raw.OrganizationType }),
-          ...(raw.OrganizationTypeText != null && {
-            organizationTypeText: raw.OrganizationTypeText,
-          }),
-          ...(raw.FunctionInAgency != null && { functionInAgency: raw.FunctionInAgency }),
-          ...(raw.FunctionInAgencyText != null && {
-            functionInAgencyText: raw.FunctionInAgencyText,
-          }),
-          ...(raw.Paid != null && { paid: raw.Paid }),
-          ...(raw.SortOrder != null && { sortOrder: raw.SortOrder }),
-          ...(raw.Modified != null && { modifiedAt: raw.Modified }),
-        };
-      }),
-    };
+    return { ...page, items: page.items.map((raw) => interest(raw, language)) };
   }
 }

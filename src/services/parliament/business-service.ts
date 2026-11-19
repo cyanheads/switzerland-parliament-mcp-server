@@ -8,6 +8,7 @@ import { serializationError, validationError } from '@cyanheads/mcp-ts-core/erro
 import { readBusinessCursor } from './business-cursor.js';
 import {
   BUSINESS_DETAIL_FIELDS,
+  BUSINESS_ROLE_CODES,
   BUSINESS_SUMMARY_FIELDS,
   BUSINESS_TEXT_FIELDS,
   BusinessIdentifierSchema,
@@ -106,48 +107,93 @@ function businessPredicates(filters: BusinessSearchFilters, prefix = ''): string
     clauses.push(`${prefix}SubmissionDate ge ${odataDay(filters.submittedFrom)}`);
   if (filters.submittedTo !== undefined)
     clauses.push(`${prefix}SubmissionDate le ${odataDay(filters.submittedTo, 'end')}`);
+  if (filters.tagId !== undefined) {
+    // Tags is a pipe-delimited ID list; match whole elements so 12 never matches 1216 or 28|1216.
+    const tags = `${prefix}Tags`;
+    const id = filters.tagId;
+    clauses.push(
+      `(${tags} eq ${odataString(id)} or startswith(${tags},${odataString(`${id}|`)}) or endswith(${tags},${odataString(`|${id}`)}) or substringof(${odataString(`|${id}|`)},${tags}))`,
+    );
+  }
   return clauses;
 }
 
-/** Direct author discovery uses lookahead; other direct searches retain exact source totals. */
-export async function searchBusiness(
+/**
+ * Route business discovery: committee and member searches read BusinessRole rows; every other
+ * search reads Business directly. Cursors are checked against the filters before any request.
+ */
+export function searchBusiness(
   filters: BusinessSearchFilters,
   workflow: WorkflowContext,
 ): Promise<ODataPage<BusinessSummary>> {
   const after = readBusinessCursor(filters);
-  if (!filters.committeeId) {
-    const authorSearch = filters.author !== undefined;
-    const predicates = businessPredicates(filters);
-    const base: ODataQuery = {
-      entity: 'Business',
-      language: filters.language,
-      select: BUSINESS_SUMMARY_FIELDS,
-      orderBy: [{ field: 'ID', direction: 'desc' }],
-      ...(authorSearch && { includeCount: false }),
-      ...(predicates.length > 0 && { filter: predicates.join(' and ') }),
-    };
-    const page = await client.collection(
-      {
-        ...base,
-        ...(after !== undefined && {
-          filter: [...predicates, `ID lt ${odataInt32(after)}`].join(' and '),
-        }),
-      },
-      RawBusinessSchema,
-      { limit: filters.limit + (authorSearch ? 1 : 0), offset: 0 },
+  if (filters.committeeId !== undefined)
+    return searchRoles(
+      filters,
+      { label: 'committee', owner: [`CommitteeNumber eq ${odataInt32(filters.committeeId)}`] },
+      after,
       workflow,
     );
-    if (authorSearch) {
-      return {
-        items: page.items
-          .slice(0, filters.limit)
-          .map((row) => normalizeBusiness(row, filters.language)),
-        hasMore: page.items.length > filters.limit,
-      };
-    }
-    const total =
-      after === undefined
-        ? page.totalCount
+  if (filters.personNumber !== undefined)
+    return searchRoles(
+      filters,
+      {
+        label: 'member',
+        owner: [
+          `MemberCouncilNumber eq ${odataInt32(filters.personNumber)}`,
+          ...(filters.role !== undefined ? [`Role eq ${BUSINESS_ROLE_CODES[filters.role]}`] : []),
+        ],
+        counted: filters.role !== undefined,
+      },
+      after,
+      workflow,
+    );
+  return searchDirect(filters, after, workflow);
+}
+
+/**
+ * Direct author discovery uses lookahead; other direct searches retain exact source totals. A tag
+ * continuation reports none: recounting would repeat the costly Tags scan the page already paid.
+ */
+async function searchDirect(
+  filters: BusinessSearchFilters,
+  after: string | undefined,
+  workflow: WorkflowContext,
+): Promise<ODataPage<BusinessSummary>> {
+  const authorSearch = filters.author !== undefined;
+  const predicates = businessPredicates(filters);
+  const base: ODataQuery = {
+    entity: 'Business',
+    language: filters.language,
+    select: BUSINESS_SUMMARY_FIELDS,
+    orderBy: [{ field: 'ID', direction: 'desc' }],
+    ...(authorSearch && { includeCount: false }),
+    ...(predicates.length > 0 && { filter: predicates.join(' and ') }),
+  };
+  const page = await client.collection(
+    {
+      ...base,
+      ...(after !== undefined && {
+        filter: [...predicates, `ID lt ${odataInt32(after)}`].join(' and '),
+      }),
+    },
+    RawBusinessSchema,
+    { limit: filters.limit + (authorSearch ? 1 : 0), offset: 0 },
+    workflow,
+  );
+  if (authorSearch) {
+    return {
+      items: page.items
+        .slice(0, filters.limit)
+        .map((row) => normalizeBusiness(row, filters.language)),
+      hasMore: page.items.length > filters.limit,
+    };
+  }
+  const total =
+    after === undefined
+      ? page.totalCount
+      : filters.tagId !== undefined
+        ? undefined
         : (
             await client.collection(
               { ...base, select: ['ID', 'Language'] },
@@ -156,14 +202,34 @@ export async function searchBusiness(
               workflow,
             )
           ).totalCount;
-    return {
-      items: page.items.map((row) => normalizeBusiness(row, filters.language)),
-      hasMore: page.hasMore,
-      ...(total !== undefined && { totalCount: total }),
-    };
-  }
+  return {
+    items: page.items.map((row) => normalizeBusiness(row, filters.language)),
+    hasMore: page.hasMore,
+    ...(total !== undefined && { totalCount: total }),
+  };
+}
+
+/** Whose BusinessRole rows a role search reads, and whether they are one row per business. */
+interface RoleOwner {
+  /** Count the rows: only a single member role is known to hold one row per business. */
+  readonly counted?: boolean;
+  readonly label: 'committee' | 'member';
+  readonly owner: readonly string[];
+}
+
+/**
+ * Page role rows by business number, collapse each business's rows, hydrate summaries in batches,
+ * and probe one older row for continuation. Uncounted routes never request a count they discard;
+ * a counted route takes its first page's inline count and recounts the original filters later.
+ */
+async function searchRoles(
+  filters: BusinessSearchFilters,
+  { counted = false, label, owner }: RoleOwner,
+  after: string | undefined,
+  workflow: WorkflowContext,
+): Promise<ODataPage<BusinessSummary>> {
   const predicates = [
-    `CommitteeNumber eq ${odataInt32(filters.committeeId)}`,
+    ...owner,
     `Businesses/Language eq ${odataString(filters.language.toUpperCase())}`,
     ...businessPredicates(filters, 'Businesses/'),
   ];
@@ -177,10 +243,12 @@ export async function searchBusiness(
       { field: 'ID', direction: 'asc' },
     ],
     filter: predicates.join(' and '),
+    includeCount: false,
   };
   const page = await client.collection(
     {
       ...base,
+      includeCount: counted && after === undefined,
       ...(after !== undefined && {
         filter: [...predicates, `BusinessNumber lt ${odataInt32(after)}`].join(' and '),
       }),
@@ -189,11 +257,24 @@ export async function searchBusiness(
     { limit: filters.limit, offset: 0 },
     workflow,
   );
+  const totalCount = !counted
+    ? undefined
+    : after === undefined
+      ? page.totalCount
+      : (
+          await client.collection(
+            { ...base, includeCount: true },
+            roleSchema,
+            { limit: 1, offset: 0 },
+            workflow,
+          )
+        ).totalCount;
+  const total = totalCount !== undefined ? { totalCount } : {};
   const businessIds = new Set<number>();
   for (const row of page.items) {
     if (row.Language !== filters.language.toUpperCase())
       throw serializationError(
-        'Parliament returned a committee role in a different metadata language.',
+        `Parliament returned a ${label} role in a different metadata language.`,
       );
     businessIds.add(row.BusinessNumber);
   }
@@ -218,20 +299,20 @@ export async function searchBusiness(
     for (const row of summaries.items) {
       if (!expected.has(row.ID) || businesses.has(row.ID))
         throw serializationError(
-          'Parliament returned an unexpected or duplicate committee business summary.',
+          `Parliament returned an unexpected or duplicate ${label} business summary.`,
         );
       businesses.set(row.ID, normalizeBusiness(row, filters.language));
     }
     if (summaries.items.length !== batch.length)
       throw serializationError(
-        'Parliament omitted a requested committee business summary. Retry the search.',
+        `Parliament omitted a requested ${label} business summary. Retry the search.`,
       );
   }
   const items = [...businesses.values()].sort(
     (a, b) => Number(b.businessId) - Number(a.businessId),
   );
   const smallest = ids.at(-1);
-  if (smallest === undefined) return { items, hasMore: false };
+  if (smallest === undefined) return { items, hasMore: false, ...total };
   const older = await client.collection(
     {
       ...base,
@@ -243,9 +324,9 @@ export async function searchBusiness(
   );
   for (const row of older.items) {
     if (row.Language !== filters.language.toUpperCase() || row.BusinessNumber >= smallest)
-      throw serializationError('Parliament returned a mismatched committee sentinel.');
+      throw serializationError(`Parliament returned a mismatched ${label} sentinel.`);
   }
-  return { items, hasMore: older.items.length > 0 };
+  return { items, hasMore: older.items.length > 0, ...total };
 }
 
 /** Build overview metadata and availability without putting large text into the overview. */

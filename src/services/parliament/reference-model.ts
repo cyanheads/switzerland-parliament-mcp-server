@@ -12,6 +12,7 @@ export const ReferenceTopicSchema = z.enum([
   'coverage',
   'languages',
   'business_types',
+  'tags',
   'statuses',
   'councils',
   'cantons',
@@ -23,6 +24,13 @@ export const ReferenceTopicSchema = z.enum([
 
 /** Reference topic discriminator. */
 export type ReferenceTopic = z.infer<typeof ReferenceTopicSchema>;
+
+/** Live name dictionaries whose rendered label and abbreviation the source matches by substring. */
+export const ReferenceQueryTopicSchema = ReferenceTopicSchema.extract([
+  'committees',
+  'parties',
+  'groups',
+]);
 
 /** A documented reference entry; missing source labels remain unknown. */
 export const ReferenceItemSchema = z
@@ -83,6 +91,12 @@ export const ReferenceFiltersSchema = z
   .object({
     topic: ReferenceTopicSchema.describe('Requested reference topic.'),
     language: MetadataLanguageSchema.describe('Requested metadata label language.'),
+    query: z
+      .string()
+      .optional()
+      .describe(
+        'Label or abbreviation substring matched in the requested metadata language, if supplied.',
+      ),
     dateFrom: IsoDaySchema.optional().describe(
       'Inclusive session StartDate lower bound, if supplied.',
     ),
@@ -93,11 +107,7 @@ export const ReferenceFiltersSchema = z
       .positive()
       .max(100)
       .describe('Effective maximum entries requested from the source, capped at 100.'),
-    offset: z
-      .number()
-      .int()
-      .nonnegative()
-      .describe('Requested starting row, before any whole-item response-size fitting.'),
+    offset: z.number().int().nonnegative().describe('Requested starting row.'),
   })
   .describe('Normalized reference filters and resolved paging defaults.');
 

@@ -15,11 +15,12 @@ const CursorSchema = z
     fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
     language: MetadataLanguageSchema,
     order: z.literal('business_id_desc'),
-    route: z.enum(['business', 'committee']),
+    route: z.enum(['business', 'committee', 'member']),
     lastBusinessId: Int32IdSchema,
   })
   .strict();
 
+/** Absent filters drop out of the fingerprint JSON, so cursors issued before a filter existed stay valid. */
 function context(filters: BusinessSearchFilters) {
   const {
     language,
@@ -31,6 +32,9 @@ function context(filters: BusinessSearchFilters) {
     committeeId,
     submittedFrom,
     submittedTo,
+    personNumber,
+    role,
+    tagId,
   } = filters;
   return {
     fingerprint: createHash('sha256')
@@ -45,11 +49,19 @@ function context(filters: BusinessSearchFilters) {
           committeeId,
           submittedFrom,
           submittedTo,
+          personNumber,
+          role,
+          tagId,
         }),
       )
       .digest('hex'),
     language,
-    route: committeeId ? ('committee' as const) : ('business' as const),
+    route:
+      committeeId !== undefined
+        ? ('committee' as const)
+        : personNumber !== undefined
+          ? ('member' as const)
+          : ('business' as const),
     order: 'business_id_desc' as const,
   };
 }

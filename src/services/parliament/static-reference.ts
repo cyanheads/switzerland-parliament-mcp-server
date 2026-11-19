@@ -28,7 +28,7 @@ const identifiers: readonly ReferenceItem[] = [
     id: 'council',
     label: 'Council selectors',
     description:
-      'Server explanation: tool council selectors are N or S, or the exact Nationalrat / Conseil national / Consiglio nazionale and Ständerat / Conseil des États / Consiglio degli Stati aliases. Numeric council dictionary keys are separate source values.',
+      'Server explanation: tool council selectors are N or S, or the exact Nationalrat / Conseil national / Consiglio nazionale and Ständerat / Conseil des États (also unaccented, as the source publishes it) / Consiglio degli Stati aliases. Numeric council dictionary keys are separate source values.',
   },
   {
     id: 'dates',
@@ -40,7 +40,7 @@ const identifiers: readonly ReferenceItem[] = [
     id: 'person',
     label: 'PersonNumber',
     description:
-      'Server explanation: use the positive signed Int32 PersonNumber as a decimal string. It differs from Person.ID, PersonIdCode, and history-row keys.',
+      'Server explanation: use the positive signed Int32 PersonNumber as a decimal string. It is the key member tools and BusinessRole.MemberCouncilNumber share, and it differs from PersonIdCode and history-row keys.',
   },
   {
     id: 'reference',

@@ -94,7 +94,7 @@ export const TranscriptSchema = z
     personNumber: z
       .string()
       .optional()
-      .describe('Published speaker PersonNumber, distinct from Person.ID.'),
+      .describe('Published speaker PersonNumber, the key chparl_get_member takes.'),
     speakerFirstName: z.string().optional().describe('Original speaker first name.'),
     speakerLastName: z.string().optional().describe('Original speaker last name.'),
     speakerName: z
@@ -111,7 +111,11 @@ export const TranscriptSchema = z
       .optional()
       .describe('Published calendar day as YYYY-MM-DD, without an inferred timezone.'),
     sessionId: z.string().optional().describe('Published IdSession string.'),
-    sortOrder: z.number().int().optional().describe('Published passage sort order.'),
+    sortOrder: z
+      .number()
+      .int()
+      .optional()
+      .describe("Published SortOrder: speaking order within the passage's debate subject, from 1."),
     startTime: z
       .string()
       .optional()

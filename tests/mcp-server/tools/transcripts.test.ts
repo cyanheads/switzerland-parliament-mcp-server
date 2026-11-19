@@ -249,7 +249,9 @@ describe('chparl_search_transcripts', () => {
     expect(url.searchParams.get('$filter')).toBe(
       "Language eq 'DE' and ((IdSubject eq 9007199254740995L) and PersonNumber eq 1001 and IdSession eq '50' and MeetingCouncilAbbreviation eq 'N' and MeetingDate ge '20261001' and MeetingDate le '20261031' and substringof('l''été & 原',Text))",
     );
-    expect(url.searchParams.get('$orderby')).toBe('ID asc');
+    expect(url.searchParams.get('$orderby')).toBe(
+      'MeetingDate asc,MeetingVerbalixOid asc,IdSubject asc,SortOrder asc,ID asc',
+    );
     expectVoteParity(result);
   });
 
@@ -271,10 +273,10 @@ describe('chparl_search_transcripts', () => {
   });
 
   it.each([
-    { includeText: false, max: 100, count: 100 },
-    { includeText: true, max: 10, count: 10 },
+    { includeText: false, max: 100, count: 105 },
+    { includeText: true, max: 10, count: 15 },
   ])(
-    'requests the includeText=$includeText maximum and fits the complete response',
+    'requests the includeText=$includeText maximum and returns a full page',
     async ({ includeText, max, count }) => {
       rows = Array.from({ length: count }, (_, i) => ({ ID: String(1000 + i), Language: 'DE' }));
       const result = await runToolContract(searchTranscriptsTool, {
@@ -285,21 +287,23 @@ describe('chparl_search_transcripts', () => {
       expect(result.structuredContent).toMatchObject({
         effectiveLimit: max,
         totalCount: count,
+        returnedCount: max,
+        hasMore: true,
+        nextOffset: max,
         notice: expect.stringContaining(`clamped to ${max}`),
       });
-      const delivered = searchTranscriptsTool.output.parse(result.structuredContent).transcripts
-        .length;
-      expect(delivered).toBeGreaterThan(0);
-      expect(delivered).toBeLessThanOrEqual(count);
-      expect(WireSchema.parse(result.structuredContent).returnedCount).toBe(delivered);
-      expect(WireSchema.parse(result.structuredContent).hasMore).toBe(delivered < count);
+      expect(
+        searchTranscriptsTool.output
+          .parse(result.structuredContent)
+          .transcripts.map((passage) => passage.transcriptId),
+      ).toEqual(rows.slice(0, max).map((row) => row.ID));
       expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$top')).toBe(String(max));
       expectVoteParity(result);
     },
   );
 
-  it('fits whole text passages and advances only by actual delivered records', async () => {
-    rows = Array.from({ length: 10 }, (_, i) => ({
+  it('returns a full text page of large passages and advances by delivered records', async () => {
+    rows = Array.from({ length: 20 }, (_, i) => ({
       ID: String(1000 + i),
       Language: 'DE',
       Text: `<p>${'原'.repeat(900)}\r\n${i}</p>`,
@@ -311,42 +315,54 @@ describe('chparl_search_transcripts', () => {
       offset: 2,
     });
     const passages = searchTranscriptsTool.output.parse(result.structuredContent).transcripts;
-    expect(passages.length).toBeGreaterThan(0);
-    expect(passages.length).toBeLessThan(8);
-    expect(passages.map((row) => row.text)).toEqual(
-      rows.slice(2, 2 + passages.length).map((row) => row.Text),
-    );
+    expect(passages.map((row) => row.text)).toEqual(rows.slice(2, 12).map((row) => row.Text));
     expect(result.structuredContent).toMatchObject({
-      returnedCount: passages.length,
-      nextOffset: 2 + passages.length,
-      totalCount: 10,
+      returnedCount: 10,
+      effectiveLimit: 10,
+      nextOffset: 12,
+      totalCount: 20,
       hasMore: true,
     });
-    expect(
-      new TextEncoder().encode(
-        JSON.stringify({ structuredContent: result.structuredContent, content: result.content }),
-      ).byteLength,
-    ).toBeLessThan(24_000);
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    // Ten 2.7 KB passages on both surfaces exceed 24,000 bytes; no byte budget cuts the page.
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
     expectVoteParity(result);
   });
 
-  it.each([true, false])(
-    'retains an indivisible oversized passage whole in exact=$0 mode',
-    async (exact) => {
-      const original = `<p>${'é原'.repeat(10_000)}\r\n</p>`;
-      rows = [{ ...transcriptRow, Text: original }];
-      const result = await runToolContract(
-        searchTranscriptsTool,
-        exact ? { transcriptId } : { sessionId: '50', includeText: true, limit: 1 },
-      );
-      expect(result.structuredContent).toMatchObject({
-        transcripts: [{ text: original }],
-        notice: expect.stringContaining('returned whole'),
-      });
-      expect(textContent(result)).toContain(exact ? transcriptId : 'sessionId');
-      expectVoteParity(result);
-    },
-  );
+  it('retains an indivisible oversized passage whole in exact=true mode', async () => {
+    const original = `<p>${'é原'.repeat(10_000)}\r\n</p>`;
+    rows = [{ ...transcriptRow, Text: original }];
+    const result = await runToolContract(searchTranscriptsTool, { transcriptId });
+    expect(result.structuredContent).toMatchObject({
+      transcripts: [{ text: original }],
+      notice: expect.stringContaining('returned whole'),
+    });
+    expect(textContent(result)).toContain(transcriptId);
+    expectVoteParity(result);
+  });
+
+  it('returns a passage over 24,000 bytes whole on a limit 1 page without a size notice', async () => {
+    const original = `<p>${'é原'.repeat(10_000)}\r\n</p>`;
+    rows = [
+      { ...transcriptRow, Text: original },
+      { ...transcriptRow, ID: '9007199254740994' },
+    ];
+    const result = await runToolContract(searchTranscriptsTool, {
+      sessionId: '50',
+      includeText: true,
+      limit: 1,
+    });
+    expect(result.structuredContent).toMatchObject({
+      transcripts: [{ transcriptId, text: original }],
+      returnedCount: 1,
+      totalCount: 2,
+      hasMore: true,
+      nextOffset: 1,
+    });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
+    expectVoteParity(result);
+  });
 
   it.each([404, 200])(
     'reports an exact passage miss for HTTP %i with discovery guidance',
@@ -636,8 +652,8 @@ describe('chparl_search_transcripts subjectBusinesses', () => {
     expectVoteParity(result);
   });
 
-  it('makes one lookup for a 100-subject page, covering only the subjects that fit without it', async () => {
-    rows = Array.from({ length: 100 }, (_, i) => ({
+  it('resolves every subject of a 100-passage page in lookups that fit the source limit', async () => {
+    rows = Array.from({ length: 120 }, (_, i) => ({
       ID: String(5000 + i),
       Language: 'DE',
       IdSubject: String(100_000 + i),
@@ -648,41 +664,38 @@ describe('chparl_search_transcripts subjectBusinesses', () => {
       Language: 'DE',
       SortOrder: 1,
     }));
+    const subjects = rows.slice(0, 100).map((row) => row.IdSubject);
     const result = await runToolContract(searchTranscriptsTool, { sessionId: '50', limit: 100 });
     expect(result.isError).not.toBe(true);
     const output = searchTranscriptsTool.output.parse(result.structuredContent);
-    const delivered = output.transcripts.length;
-    // Multi-batch splitting is proven at the service seam; a fitted page's candidates fit one batch.
-    const [candidates = [], ...rest] = lookupUrls().map(requestedSubjects);
-    expect(rest).toEqual([]);
-    expect(candidates).toEqual(rows.slice(0, candidates.length).map((row) => row.IdSubject));
-    expect(candidates.length).toBeLessThanOrEqual(50);
-    // The lookup's own bytes cut the candidate prefix again.
-    expect(candidates.length).toBeGreaterThan(delivered);
-    expect(http.calls).toHaveLength(2);
+    expect(output.transcripts.map((passage) => passage.subjectId)).toEqual(subjects);
+    // Batch sizing is tabled at the service seam; this page needs its two 50-subject batches.
+    expect(lookupUrls().map(requestedSubjects)).toEqual([
+      subjects.slice(0, 50),
+      subjects.slice(50),
+    ]);
+    expect(http.calls).toHaveLength(3);
     for (const url of lookupUrls()) expect(url.search.length - 1).toBeLessThanOrEqual(2048);
     expect(output.provenance.sources.map((source) => source.url)).toEqual(
       http.calls.map((call) => call.request.url),
     );
-    expect(output.subjectBusinesses?.map((entry) => entry.subjectId)).toEqual(
-      rows.slice(0, delivered).map((row) => row.IdSubject),
-    );
-    expect(output.subjectBusinesses?.[0]).toEqual({
-      subjectId: '100000',
-      businesses: [{ businessId: '20200000' }],
+    expect(output.subjectBusinesses?.map((entry) => entry.subjectId)).toEqual(subjects);
+    expect(output.subjectBusinesses?.[99]).toEqual({
+      subjectId: '100099',
+      businesses: [{ businessId: '20200099' }],
     });
     expect(result.structuredContent).toMatchObject({
-      returnedCount: delivered,
-      totalCount: 100,
+      returnedCount: 100,
+      effectiveLimit: 100,
+      totalCount: 120,
       hasMore: true,
-      nextOffset: delivered,
-      notice: expect.stringContaining('byte fitting'),
+      nextOffset: 100,
     });
-    expect(resultBytes(result)).toBeLessThan(24_000);
+    expect(result.structuredContent).not.toHaveProperty('notice');
     expectVoteParity(result);
   });
 
-  it('delivers a denser speaker page of maximum-width subjects by resolving only fitted candidates', async () => {
+  it('resolves all 100 maximum-width subjects of a speaker page in three lookups', async () => {
     rows = Array.from({ length: 100 }, (_, i) => ({
       ID: String(7000 + i),
       Language: 'DE',
@@ -712,17 +725,13 @@ describe('chparl_search_transcripts subjectBusinesses', () => {
     });
     expect(result.isError).not.toBe(true);
     const output = searchTranscriptsTool.output.parse(result.structuredContent);
-    const delivered = output.transcripts.length;
-    // Resolving all 100 fetched subjects first costs three near-limit lookup URLs and 6 passages.
-    expect(delivered).toBeGreaterThan(6);
-    const [candidates = [], ...rest] = lookupUrls().map(requestedSubjects);
-    expect(rest).toEqual([]);
-    expect(candidates).toEqual(rows.slice(0, candidates.length).map((row) => row.IdSubject));
-    expect(candidates.length).toBeGreaterThanOrEqual(delivered);
-    expect(candidates.length).toBeLessThanOrEqual(48);
+    expect(output.transcripts).toHaveLength(100);
+    const batches = lookupUrls().map(requestedSubjects);
+    expect(batches.map((batch) => batch.length)).toEqual([48, 48, 4]);
+    expect(batches.flat()).toEqual(rows.map((row) => row.IdSubject));
     for (const url of lookupUrls()) expect(url.search.length - 1).toBeLessThanOrEqual(2048);
     expect(output.subjectBusinesses).toEqual(
-      rows.slice(0, delivered).map((row, i) => ({
+      rows.map((row, i) => ({
         subjectId: row.IdSubject,
         businesses: [
           {
@@ -734,18 +743,17 @@ describe('chparl_search_transcripts subjectBusinesses', () => {
       })),
     );
     expect(result.structuredContent).toMatchObject({
-      returnedCount: delivered,
+      returnedCount: 100,
       totalCount: 100,
-      hasMore: true,
-      nextOffset: delivered,
-      notice: expect.stringContaining('byte fitting'),
+      hasMore: false,
     });
-    expect(resultBytes(result)).toBeLessThan(24_000);
+    expect(result.structuredContent).not.toHaveProperty('nextOffset');
+    expect(result.structuredContent).not.toHaveProperty('notice');
     expectVoteParity(result);
   });
 
-  it('continues a page the first fit cut when the lookup fits in its remaining bytes', async () => {
-    // Each passage costs about 8 KB across both surfaces: two fit, three do not, with or without the lookup.
+  it('returns every large passage of a full-text page with its subject businesses', async () => {
+    // Each passage costs about 8 KB across both surfaces.
     rows = Array.from({ length: 4 }, (_, i) => ({
       ID: String(8000 + i),
       Language: 'DE',
@@ -759,7 +767,12 @@ describe('chparl_search_transcripts subjectBusinesses', () => {
       limit: 10,
     });
     const output = searchTranscriptsTool.output.parse(result.structuredContent);
-    expect(output.transcripts.map((passage) => passage.transcriptId)).toEqual(['8000', '8001']);
+    expect(output.transcripts.map((passage) => passage.transcriptId)).toEqual([
+      '8000',
+      '8001',
+      '8002',
+      '8003',
+    ]);
     expect(output.subjectBusinesses).toEqual([
       {
         subjectId: '50854',
@@ -768,17 +781,16 @@ describe('chparl_search_transcripts subjectBusinesses', () => {
     ]);
     expect(lookupUrls().map(requestedSubjects)).toEqual([['50854']]);
     expect(result.structuredContent).toMatchObject({
-      returnedCount: 2,
+      returnedCount: 4,
       totalCount: 4,
-      hasMore: true,
-      nextOffset: 2,
-      notice: expect.stringContaining('byte fitting'),
+      hasMore: false,
     });
-    expect(resultBytes(result)).toBeLessThan(24_000);
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
     expectVoteParity(result);
   });
 
-  it('measures subjectBusinesses in byte fitting and lists only delivered subjects', async () => {
+  it('lists all 13 businesses of every subject on a full default page', async () => {
     rows = Array.from({ length: 20 }, (_, i) => ({
       ID: String(6000 + i),
       Language: 'DE',
@@ -789,22 +801,20 @@ describe('chparl_search_transcripts subjectBusinesses', () => {
     );
     const result = await runToolContract(searchTranscriptsTool, { sessionId: '50' });
     const output = searchTranscriptsTool.output.parse(result.structuredContent);
-    const delivered = output.transcripts.length;
-    expect(delivered).toBeGreaterThan(0);
-    expect(delivered).toBeLessThan(20);
-    // All 20 fit without the lookup, so it covers every fetched subject; only its list cuts the page.
+    expect(output.transcripts).toHaveLength(20);
     expect(lookupUrls().map(requestedSubjects)).toEqual([rows.map((row) => row.IdSubject)]);
     expect(output.subjectBusinesses?.map((entry) => entry.subjectId)).toEqual(
-      rows.slice(0, delivered).map((row) => row.IdSubject),
+      rows.map((row) => row.IdSubject),
     );
     expect(output.subjectBusinesses?.every((entry) => entry.businesses.length === 13)).toBe(true);
     expect(result.structuredContent).toMatchObject({
-      returnedCount: delivered,
-      hasMore: true,
-      nextOffset: delivered,
-      notice: expect.stringContaining('byte fitting'),
+      returnedCount: 20,
+      effectiveLimit: 20,
+      totalCount: 20,
+      hasMore: false,
     });
-    expect(resultBytes(result)).toBeLessThan(24_000);
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
     expectVoteParity(result);
   });
 
@@ -956,8 +966,8 @@ describe('chparl_search_transcripts subjectBusinesses', () => {
     expectVoteParity(degraded);
   });
 
-  it('joins a degraded lookup notice with the byte-fitting notice on a cut page', async () => {
-    // Each passage costs about 8 KB across both surfaces: two of the four fit.
+  it('delivers a full page of large passages with only the lookup notice when the lookup fails', async () => {
+    // Each passage costs about 8 KB across both surfaces.
     rows = Array.from({ length: 4 }, (_, i) => ({
       ID: String(8000 + i),
       Language: 'DE',
@@ -972,21 +982,26 @@ describe('chparl_search_transcripts subjectBusinesses', () => {
     });
     expect(result.isError).not.toBe(true);
     const output = searchTranscriptsTool.output.parse(result.structuredContent);
-    expect(output.transcripts.map((passage) => passage.transcriptId)).toEqual(['8000', '8001']);
+    expect(output.transcripts.map((passage) => passage.transcriptId)).toEqual([
+      '8000',
+      '8001',
+      '8002',
+      '8003',
+    ]);
     expect(result.structuredContent).not.toHaveProperty('subjectBusinesses');
     expect(result.structuredContent).toMatchObject({
-      returnedCount: 2,
+      returnedCount: 4,
       totalCount: 4,
-      hasMore: true,
-      nextOffset: 2,
+      hasMore: false,
     });
     const notice = WireSchema.parse(result.structuredContent).notice;
-    for (const part of ['byte fitting', 'refused the request', 'subjectBusinesses is omitted']) {
+    for (const part of ['refused the request', 'subjectBusinesses is omitted']) {
       expect(notice).toContain(part);
       expect(textContent(result)).toContain(part);
     }
+    expect(notice).not.toContain('byte fitting');
     expect(lookupUrls().map(requestedSubjects)).toEqual([['50854']]);
-    expect(resultBytes(result)).toBeLessThan(24_000);
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
     expectVoteParity(result);
   });
 });

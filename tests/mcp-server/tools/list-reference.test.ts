@@ -9,7 +9,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listReferenceTool } from '@/mcp-server/tools/definitions/list-reference.tool.js';
 import { completeResultBytes } from '@/mcp-server/tools/parliament-format.js';
 import { initParliamentService } from '@/services/parliament/parliament-service.js';
-import { decodeParliamentMarkdown, parliamentHttp, textContent } from '../../helpers/parliament.js';
+import {
+  decodeParliamentMarkdown,
+  parliamentHttp,
+  resultBytes,
+  textContent,
+} from '../../helpers/parliament.js';
 
 let http: ReturnType<typeof parliamentHttp>;
 beforeEach(() => {
@@ -75,6 +80,7 @@ describe('chparl_list_reference', () => {
     const result = await runToolContract(listReferenceTool, {
       topic: 'sessions',
       language: ' FR ',
+      query: ' ',
       dateFrom: ' ',
       dateTo: '',
       limit: 10_000,
@@ -90,6 +96,7 @@ describe('chparl_list_reference', () => {
       notice: expect.stringContaining('clamped to 100'),
     });
     expect(result.structuredContent).not.toHaveProperty('nextOffset');
+    expect(result.structuredContent).not.toHaveProperty('effectiveFilters.query');
     const text = textContent(result);
     expect(text).toContain('past the last matching reference entry');
     expect(text).toContain('offset zero');
@@ -116,6 +123,33 @@ describe('chparl_list_reference', () => {
     expect(textContent(result)).not.toContain('past the last');
   });
 
+  it.each([
+    {
+      topic: 'sessions',
+      notice:
+        'The requested offset is past the last matching reference entry. No reference entries occur on this page. Call chparl_list_reference for this topic with offset zero, or revise the session dates.',
+    },
+    {
+      topic: 'committees',
+      notice:
+        'The requested offset is past the last matching reference entry. No reference entries occur on this page. Call chparl_list_reference for this topic with offset zero.',
+    },
+  ] as const)(
+    'advises session dates past the end only for a dated topic: $topic',
+    async ({ topic, notice }) => {
+      serve({ d: { results: [], __count: '3' } });
+      const result = await runToolContract(listReferenceTool, { topic, offset: 9 });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        items: [],
+        totalCount: 3,
+        hasMore: false,
+        notice,
+      });
+      expect(textContent(result)).toContain(notice);
+    },
+  );
+
   it('delivers a maximum page and a caller continuation from actual rows', async () => {
     serve({
       d: {
@@ -135,7 +169,7 @@ describe('chparl_list_reference', () => {
     expect(textContent(result)).toContain('100');
   });
 
-  it('fits whole reference labels and measures the actual enriched result exactly', async () => {
+  it('delivers every large label on a full page and measures the actual enriched result exactly', async () => {
     const originals = Array.from({ length: 20 }, (_, index) => ({
       ID: index + 1,
       Language: 'DE',
@@ -149,45 +183,238 @@ describe('chparl_list_reference', () => {
     });
     expect(result.isError).not.toBe(true);
     const output = listReferenceTool.output.parse(result.structuredContent);
-    const count = output.items.length;
-    expect(count).toBeGreaterThan(0);
-    expect(count).toBeLessThan(20);
     expect(output.items).toEqual(
-      originals.slice(0, count).map((item) => ({ id: String(item.ID), label: item.CouncilName })),
+      originals.map((item) => ({ id: String(item.ID), label: item.CouncilName })),
     );
     expect(result.structuredContent).toMatchObject({
-      returnedCount: count,
-      nextOffset: 5 + count,
+      returnedCount: 20,
+      effectiveLimit: 20,
+      nextOffset: 25,
       totalCount: 40,
       hasMore: true,
     });
+    expect(result.structuredContent).not.toHaveProperty('notice');
     const enrichment = Object.fromEntries(
       Object.entries(result.structuredContent ?? {}).filter(
         ([key]) => !['topic', 'items', 'provenance'].includes(key),
       ),
     );
-    const actualBytes = new TextEncoder().encode(
-      JSON.stringify({ structuredContent: result.structuredContent, content: result.content }),
-    ).byteLength;
+    const actualBytes = resultBytes(result);
     expect(completeResultBytes(output, enrichment)).toBe(actualBytes);
-    expect(actualBytes).toBeLessThan(24_000);
+    expect(actualBytes).toBeGreaterThan(24_000);
     const decoded = decodeParliamentMarkdown(textContent(result));
-    for (const original of originals.slice(0, count))
-      expect(decoded.strings).toContain(original.CouncilName);
+    for (const original of originals) expect(decoded.strings).toContain(original.CouncilName);
   });
 
-  it('returns an oversized indivisible source label whole with its exact retrieval path', async () => {
+  it('returns a label over 24,000 bytes whole on a limit 1 page with no size notice', async () => {
     const label = `<p>${'é'.repeat(15_000)}</p>`;
-    serve({ d: { results: [{ ID: 1, Language: 'DE', CouncilName: label }], __count: '1' } });
+    serve({ d: { results: [{ ID: 1, Language: 'DE', CouncilName: label }], __count: '2' } });
     const result = await runToolContract(listReferenceTool, { topic: 'councils', limit: 1 });
     expect(result.structuredContent).toMatchObject({
       items: [{ id: '1', label }],
       returnedCount: 1,
-      hasMore: false,
-      notice: expect.stringContaining('topic=councils, language=de, offset=0, limit=1'),
+      nextOffset: 1,
+      hasMore: true,
     });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
     expect(decodeParliamentMarkdown(textContent(result)).strings).toContain(label);
   });
+
+  it('pages a committee query over the filtered set and echoes query on both surfaces', async () => {
+    const committee = (number: number, abbreviation: string, name: string) => ({
+      ID: number * 10,
+      Language: 'DE',
+      CommitteeNumber: number,
+      CommitteeName: name,
+      Abbreviation1: abbreviation,
+    });
+    const pages: Record<string, unknown[]> = {
+      '0': [
+        committee(10, 'WAK-N', 'Kommission für Wirtschaft und Abgaben Nationalrat'),
+        committee(23, 'WAK-S', 'Kommission für Wirtschaft und Abgaben Ständerat'),
+      ],
+      '2': [
+        committee(1131, 'WAK-N WAK-N 17.400', 'Subkommission'),
+        committee(10011, 'WAK-N SUBKO 23.462', 'Subkommission'),
+      ],
+      '4': [],
+    };
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) =>
+        Response.json({
+          d: {
+            results: pages[new URL(request.url).searchParams.get('$skip') ?? ''],
+            __count: '4',
+          },
+        }),
+    });
+    const walk = [];
+    for (const offset of [0, 2, 4])
+      walk.push(
+        await runToolContract(listReferenceTool, {
+          topic: 'committees',
+          query: ' WAK ',
+          limit: 2,
+          offset,
+        }),
+      );
+    expect(
+      walk.map((result) => listReferenceTool.output.parse(result.structuredContent).items),
+    ).toEqual([
+      [
+        {
+          id: '10',
+          label: 'Kommission für Wirtschaft und Abgaben Nationalrat',
+          abbreviation: 'WAK-N',
+        },
+        {
+          id: '23',
+          label: 'Kommission für Wirtschaft und Abgaben Ständerat',
+          abbreviation: 'WAK-S',
+        },
+      ],
+      [
+        { id: '1131', label: 'Subkommission', abbreviation: 'WAK-N WAK-N 17.400' },
+        { id: '10011', label: 'Subkommission', abbreviation: 'WAK-N SUBKO 23.462' },
+      ],
+      [],
+    ]);
+    expect(walk[0]?.structuredContent).toMatchObject({
+      effectiveFilters: { topic: 'committees', language: 'de', query: 'WAK', limit: 2, offset: 0 },
+      returnedCount: 2,
+      totalCount: 4,
+      nextOffset: 2,
+      hasMore: true,
+    });
+    expect(walk[1]?.structuredContent).toMatchObject({ totalCount: 4, hasMore: false });
+    expect(walk[1]?.structuredContent).not.toHaveProperty('nextOffset');
+    expect(walk[2]?.structuredContent).toMatchObject({
+      totalCount: 4,
+      hasMore: false,
+      notice: expect.stringContaining('past the last matching reference entry'),
+    });
+    expect(decodeParliamentMarkdown(textContent(walk[0]!)).strings).toContain(
+      'effectiveFilters.query: WAK',
+    );
+    expect(
+      http.calls.map((call) => {
+        const url = new URL(call.request.url);
+        return [url.searchParams.get('$filter'), url.searchParams.get('$skip')];
+      }),
+    ).toEqual(
+      ['0', '2', '4'].map((skip) => [
+        "Language eq 'DE' and ((substringof('WAK',CommitteeName) or substringof('WAK',Abbreviation1)))",
+        skip,
+      ]),
+    );
+  });
+
+  it('names query and its metadata language in the zero-hit notice', async () => {
+    serve({ d: { results: [], __count: '0' } });
+    const result = await runToolContract(listReferenceTool, {
+      topic: 'parties',
+      language: 'fr',
+      query: 'SP',
+    });
+    expect(result.structuredContent).toMatchObject({
+      items: [],
+      totalCount: 0,
+      effectiveFilters: { topic: 'parties', language: 'fr', query: 'SP' },
+      notice: expect.stringContaining('No reference entries matched the query'),
+    });
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('query');
+    expect(notice).toContain('language fr');
+    expect(textContent(result)).toContain(notice);
+  });
+
+  it('lists live business topic tags without abbreviations and keeps an unpublished name unknown', async () => {
+    serve({
+      d: {
+        results: [
+          { ID: 4, Language: 'IT', TagName: 'Politica istituzionale' },
+          { ID: 66, Language: 'IT', TagName: 'Energia' },
+          { ID: 1216, Language: 'IT', TagName: null },
+        ],
+        __count: '28',
+      },
+    });
+    const result = await runToolContract(listReferenceTool, {
+      topic: 'tags',
+      language: 'it',
+      limit: 3,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(listReferenceTool.output.parse(result.structuredContent).items).toEqual([
+      { id: '4', label: 'Politica istituzionale' },
+      { id: '66', label: 'Energia' },
+      { id: '1216' },
+    ]);
+    expect(result.structuredContent).toMatchObject({
+      topic: 'tags',
+      returnedCount: 3,
+      totalCount: 28,
+      nextOffset: 3,
+      hasMore: true,
+    });
+    const decoded = decodeParliamentMarkdown(textContent(result));
+    expect(decoded.strings).toContain('items[1].id: 66');
+    expect(decoded.strings).toContain('items[1].label: Energia');
+    expect(decoded.strings).toContain('items[2].id: 1216');
+    expect(decoded.strings.some((line) => line.startsWith('items[2].label'))).toBe(false);
+    expect(new URL(http.calls[0]?.request.url ?? '').pathname).toBe('/odata.svc/Tags');
+    expect(listReferenceTool.description).toContain('chparl_search_business tagId');
+  });
+
+  it('refuses a query past the 2048-byte source query string before any request', async () => {
+    const result = await runToolContract(listReferenceTool, {
+      topic: 'committees',
+      query: 'x'.repeat(1_000),
+    });
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'request_too_long',
+          recovery: { hint: expect.stringContaining('Shorten query') },
+        },
+      },
+    });
+    expect(textContent(result)).toContain('request_too_long');
+    expect(textContent(result)).toContain('Shorten query');
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it.each([
+    'identifiers',
+    'coverage',
+    'languages',
+    'statuses',
+    'business_types',
+    'tags',
+    'councils',
+    'cantons',
+    'sessions',
+  ] as const)(
+    'rejects query on topic %s as incompatible_fields before any request',
+    async (topic) => {
+      const result = await runToolContract(listReferenceTool, { topic, query: 'WAK' });
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'incompatible_fields',
+            recovery: { hint: expect.stringContaining('committees, parties, or groups') },
+          },
+        },
+      });
+      expect(textContent(result)).toContain('committees, parties, or groups');
+      expect(http.calls).toHaveLength(0);
+    },
+  );
 
   it.each([
     { topic: 'councils', dateFrom: '2026-01-01' },

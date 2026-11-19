@@ -34,14 +34,13 @@ import {
 } from '@/services/parliament/vote-service.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import {
-  COLLECTION_RESULT_LIMIT_BYTES,
   clampNotice,
   completeResultBytes,
   fieldTrailer,
-  fitCollectionPage,
   formatParliamentResult,
   isPastEnd,
   joinNotices,
+  WHOLE_RESULT_NOTICE_BYTES,
 } from '../parliament-format.js';
 
 const ModeSchema = z.enum(['votes', 'members', 'groups']);
@@ -95,11 +94,11 @@ const OutputSchema = z.object({
   votes: z
     .array(VoteSummarySchema)
     .optional()
-    .describe('Whole metadata records delivered in votes mode.'),
+    .describe('Roll-call metadata records on this page in votes mode.'),
   members: z
     .array(MemberDecisionSchema)
     .optional()
-    .describe('Whole member decisions delivered in members mode.'),
+    .describe('Member decisions on this page in members mode.'),
   decisionCounts: DecisionCountsSchema.optional().describe(
     'Page counts in members mode or complete nonempty vote counts in groups mode.',
   ),
@@ -144,7 +143,7 @@ const EnrichmentSchema = z.object({
   notice: z
     .string()
     .optional()
-    .describe('Combined clamping, whole-item fitting, empty-result, or coverage guidance.'),
+    .describe('Combined clamping, empty-result, aggregate-size, or coverage guidance.'),
 });
 
 const coverage = { council: 'N' as const, memberRollCallsSince: '2003-winter-session' as const };
@@ -167,7 +166,7 @@ export const getVotesTool = tool('chparl_get_votes', {
       'Members or groups only: positive Int32 Vote.ID discovered through votes mode; omit for personNumber history. Cannot combine with businessId or sessionId.',
     ),
     personNumber: optionalString(Int32IdSchema).describe(
-      'Members only: exact PersonNumber from chparl_search_members, distinct from Person.ID or current group affiliation.',
+      'Members only: exact PersonNumber from chparl_search_members, not a group or party identifier.',
     ),
     sessionId: optionalString(Int32IdSchema).describe(
       'Votes or member history only: positive Int32 Session.ID from chparl_list_reference topic sessions; combine with businessId to narrow discovery.',
@@ -182,7 +181,7 @@ export const getVotesTool = tool('chparl_get_votes', {
       .max(10_000)
       .optional()
       .describe(
-        'Paged modes only: votes default 10/max 50, members default 50/max 100; higher requests are clamped with notice.',
+        'Paged modes only: votes default 10/max 50, members default 25/max 100; higher requests are clamped with notice.',
       ),
     offset: z
       .number()
@@ -246,7 +245,7 @@ export const getVotesTool = tool('chparl_get_votes', {
         throw ctx.fail('incompatible_fields');
     }
 
-    const requestedLimit = input.limit ?? (input.mode === 'votes' ? 10 : 50);
+    const requestedLimit = input.limit ?? (input.mode === 'votes' ? 10 : 25);
     const paging = {
       limit: Math.min(requestedLimit, input.mode === 'votes' ? 50 : 100),
       offset: input.offset ?? 0,
@@ -286,40 +285,30 @@ export const getVotesTool = tool('chparl_get_votes', {
           workflow,
           input.sessionId,
         );
-        const prepared = fitCollectionPage(result.items, (votes, cut, oversized) => {
-          const hasMore = cut || result.hasMore;
-          const notice = joinNotices(
-            clampNotice(requestedLimit, paging.limit),
-            cut &&
-              'Response byte fitting returned fewer whole votes. Continue with nextOffset; no fields were shortened.',
-            votes.length === 0 &&
-              (isPastEnd(result.totalCount, paging.offset)
-                ? 'The requested offset is past the last matching vote. Call chparl_get_votes with mode votes, the same filters, and offset zero.'
-                : 'No Nationalrat member roll calls matched these filters. Coverage starts in the 2003 winter session and does not include Ständerat member votes; use chparl_search_transcripts for published debate and aggregate vote announcements.'),
-            oversized &&
-              `One indivisible vote or its provenance exceeds 24000 bytes. Retrieve this exact page with chparl_get_votes mode=votes${input.businessId === undefined ? '' : `, businessId=${input.businessId}`}${input.sessionId === undefined ? '' : `, sessionId=${input.sessionId}`}, language=${input.language}, offset=${paging.offset}, limit=1. The vote is returned whole.`,
-          );
-          return {
-            output: {
-              ...base,
-              found: true,
-              ...(business !== undefined && { business }),
-              votes,
-              provenance: provenance(workflow.sources),
-            },
-            enrichment: {
-              effectiveFilters: filters,
-              returnedCount: votes.length,
-              effectiveLimit: paging.limit,
-              ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
-              hasMore,
-              ...(hasMore && { nextOffset: paging.offset + votes.length }),
-              ...(notice !== undefined && { notice }),
-            },
-          };
+        const votes = result.items;
+        const notice = joinNotices(
+          clampNotice(requestedLimit, paging.limit),
+          votes.length === 0 &&
+            (isPastEnd(result.totalCount, paging.offset)
+              ? 'The requested offset is past the last matching vote. Call chparl_get_votes with mode votes, the same filters, and offset zero.'
+              : 'No Nationalrat member roll calls matched these filters. Coverage starts in the 2003 winter session and does not include Ständerat member votes; use chparl_search_transcripts for published debate and aggregate vote announcements.'),
+        );
+        ctx.enrich({
+          effectiveFilters: filters,
+          returnedCount: votes.length,
+          effectiveLimit: paging.limit,
+          ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
+          hasMore: result.hasMore,
+          ...(result.nextOffset !== undefined && { nextOffset: result.nextOffset }),
+          ...(notice !== undefined && { notice }),
         });
-        ctx.enrich(prepared.enrichment);
-        return prepared.output;
+        return {
+          ...base,
+          found: true,
+          ...(business !== undefined && { business }),
+          votes,
+          provenance: provenance(workflow.sources),
+        };
       }
 
       const vote =
@@ -357,7 +346,7 @@ export const getVotesTool = tool('chparl_get_votes', {
           completeResultBytes(output, {
             ...enrichment,
             ...(unavailable && { notice: unavailable }),
-          }) >= COLLECTION_RESULT_LIMIT_BYTES;
+          }) >= WHOLE_RESULT_NOTICE_BYTES;
         const notice = joinNotices(
           unavailable,
           oversized &&
@@ -378,46 +367,36 @@ export const getVotesTool = tool('chparl_get_votes', {
           ...(input.sessionId !== undefined && { sessionId: input.sessionId }),
         },
       );
-      const prepared = fitCollectionPage(result.items, (members, cut, oversized) => {
-        const hasMore = cut || result.hasMore;
-        const notice = joinNotices(
-          clampNotice(requestedLimit, paging.limit),
-          cut &&
-            'Response byte fitting returned fewer whole member decisions. Continue with nextOffset; page counts cover only the delivered rows and no fields were shortened.',
-          members.length === 0 &&
-            (isPastEnd(result.totalCount, paging.offset)
-              ? 'The requested offset is past the last matching member decision. Call chparl_get_votes with mode members, the same filters, and offset zero.'
-              : input.personNumber !== undefined
-                ? input.voteId === undefined
-                  ? 'No member decisions matched these history filters. This does not establish whether the person or session exists. Use chparl_search_members or chparl_list_reference topic sessions to resolve identifiers.'
-                  : 'No member decisions matched this personNumber. Use chparl_search_members to discover a PersonNumber, or call chparl_get_votes mode members with this voteId without personNumber.'
-                : MEMBER_DATA_UNAVAILABLE),
-          oversized &&
-            `One indivisible member decision or its provenance exceeds 24000 bytes. Retrieve this exact page with chparl_get_votes mode=members${input.voteId === undefined ? '' : `, voteId=${input.voteId}`}, language=${input.language}, offset=${paging.offset}, limit=1${input.personNumber === undefined ? '' : `, personNumber=${input.personNumber}`}${input.businessId === undefined ? '' : `, businessId=${input.businessId}`}${input.sessionId === undefined ? '' : `, sessionId=${input.sessionId}`}. The decision is returned whole.`,
-        );
-        return {
-          output: {
-            ...base,
-            found: true,
-            ...(vote !== undefined && { vote }),
-            ...(business !== undefined && { business }),
-            members,
-            decisionCounts: { scope: 'page' as const, counts: countDecisions(members) },
-            provenance: provenance(workflow.sources),
-          },
-          enrichment: {
-            effectiveFilters: filters,
-            returnedCount: members.length,
-            effectiveLimit: paging.limit,
-            ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
-            hasMore,
-            ...(hasMore && { nextOffset: paging.offset + members.length }),
-            ...(notice !== undefined && { notice }),
-          },
-        };
+      const members = result.items;
+      const notice = joinNotices(
+        clampNotice(requestedLimit, paging.limit),
+        members.length === 0 &&
+          (isPastEnd(result.totalCount, paging.offset)
+            ? 'The requested offset is past the last matching member decision. Call chparl_get_votes with mode members, the same filters, and offset zero.'
+            : input.personNumber !== undefined
+              ? input.voteId === undefined
+                ? 'No member decisions matched these history filters. This does not establish whether the person or session exists. Use chparl_search_members or chparl_list_reference topic sessions to resolve identifiers.'
+                : 'No member decisions matched this personNumber. Use chparl_search_members to discover a PersonNumber, or call chparl_get_votes mode members with this voteId without personNumber.'
+              : MEMBER_DATA_UNAVAILABLE),
+      );
+      ctx.enrich({
+        effectiveFilters: filters,
+        returnedCount: members.length,
+        effectiveLimit: paging.limit,
+        ...(result.totalCount !== undefined && { totalCount: result.totalCount }),
+        hasMore: result.hasMore,
+        ...(result.nextOffset !== undefined && { nextOffset: result.nextOffset }),
+        ...(notice !== undefined && { notice }),
       });
-      ctx.enrich(prepared.enrichment);
-      return prepared.output;
+      return {
+        ...base,
+        found: true,
+        ...(vote !== undefined && { vote }),
+        ...(business !== undefined && { business }),
+        members,
+        decisionCounts: { scope: 'page', counts: countDecisions(members) },
+        provenance: provenance(workflow.sources),
+      };
     });
   },
   format: formatParliamentResult,

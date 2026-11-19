@@ -21,6 +21,23 @@ import type { WorkflowContext } from './workflow.js';
 
 const client = new ODataClient();
 
+/**
+ * A debate subject's expanded Subject and its Meeting. A deferred link carries no Language, so it
+ * fails validation instead of passing as an unknown meeting.
+ */
+const RawSubjectExpansionSchema = z.object({
+  Language: RawLanguage,
+  Meetings: z
+    .object({
+      Language: RawLanguage,
+      Date: RawDate,
+      CouncilName: RawText,
+      IdSession: RawInt32,
+      SessionName: RawText,
+    })
+    .nullable(),
+});
+
 const RawSectionSchema = z.object({
   ID: z.guid().optional(),
   Language: RawLanguage,
@@ -56,6 +73,7 @@ const RawSectionSchema = z.object({
   IdSubject: Int64IdSchema.optional(),
   SortOrder: RawInt32,
   PublishedNotes: RawText,
+  Subjects: RawSubjectExpansionSchema.nullish(),
 });
 
 /**
@@ -99,8 +117,34 @@ const BusinessSectionItemSchema = z.object({
     .string()
     .optional()
     .describe('Canonical business ID for this subject relationship.'),
-  sortOrder: z.number().int().optional().describe('Published subject order.'),
+  sortOrder: z
+    .number()
+    .int()
+    .optional()
+    .describe('Published position of this business within the debate subject.'),
   publishedNotes: z.string().optional().describe('Original published subject notes.'),
+  meetingDate: z
+    .string()
+    .optional()
+    .describe(
+      "Calendar day of the subject's debate meeting as YYYY-MM-DD, as on its transcript passages.",
+    ),
+  councilName: z
+    .string()
+    .optional()
+    .describe(
+      'Published name of the council that held the meeting, in the metadata language; chparl_search_transcripts council accepts the Nationalrat and Ständerat names.',
+    ),
+  sessionId: z
+    .string()
+    .optional()
+    .describe(
+      "Session ID of the subject's meeting, as on its transcript passages; chparl_search_transcripts accepts it as sessionId.",
+    ),
+  sessionName: z
+    .string()
+    .optional()
+    .describe('Published session name of the meeting, in the metadata language.'),
 });
 
 /** Any relationship row before the tool's per-section output parse. */
@@ -168,7 +212,11 @@ export const SubjectRowSchema = BusinessSectionItemSchema.pick({
   businessId: true,
   sortOrder: true,
   publishedNotes: true,
-}).describe('One debate-subject row.');
+  meetingDate: true,
+  councilName: true,
+  sessionId: true,
+  sessionName: true,
+}).describe('One debate-subject row with the date, council, and session of its meeting.');
 
 /** Relationship sections accepted by the direct paged reader. */
 export type BusinessRelationshipSection = Exclude<
@@ -178,6 +226,7 @@ export type BusinessRelationshipSection = Exclude<
 
 type Definition = {
   entity: ODataQuery['entity'];
+  expand?: ODataQuery['expand'];
   fields: readonly string[];
   orderBy: ODataQuery['orderBy'];
 };
@@ -257,12 +306,30 @@ const definitions: Record<BusinessRelationshipSection, Definition> = {
   },
   subjects: {
     entity: 'SubjectBusiness',
-    fields: ['IdSubject', 'Title', 'SortOrder', 'PublishedNotes', 'Modified'],
+    // Each row's one Subject and its one Meeting ride the same request; a projection that omits an
+    // expansion's fields drops the expansion from the response.
+    expand: ['Subjects/Meetings'],
+    fields: [
+      'IdSubject',
+      'Title',
+      'SortOrder',
+      'PublishedNotes',
+      'Modified',
+      'Subjects/Language',
+      'Subjects/Meetings/Language',
+      'Subjects/Meetings/Date',
+      'Subjects/Meetings/CouncilName',
+      'Subjects/Meetings/IdSession',
+      'Subjects/Meetings/SessionName',
+    ],
     orderBy: [{ field: 'IdSubject', direction: 'asc' }],
   },
 };
 
-/** Page the chosen section directly; deferred or partial navigation collections are never used. */
+/**
+ * Page the chosen section directly; deferred or partial navigation collections are never used. The
+ * subjects section expands each row's single Subject and Meeting in the same request.
+ */
 export async function listBusinessSection(
   businessId: string,
   section: BusinessRelationshipSection,
@@ -273,7 +340,12 @@ export async function listBusinessSection(
   const definition = definitions[section];
   const schema: z.ZodType<z.infer<typeof RawSectionSchema>> =
     section === 'subjects'
-      ? RawSectionSchema.extend({ IdSubject: Int64IdSchema, BusinessNumber: RawId })
+      ? RawSectionSchema.extend({
+          IdSubject: Int64IdSchema,
+          BusinessNumber: RawId,
+          // Present on every row: null is an unknown meeting, an absent key a dropped expansion.
+          Subjects: RawSubjectExpansionSchema.nullable(),
+        })
       : RawSectionSchema.extend({ ID: z.guid() });
   const page = await client.collection(
     {
@@ -281,18 +353,23 @@ export async function listBusinessSection(
       language,
       filter: `BusinessNumber eq ${odataInt32(businessId)}`,
       select: ['Language', 'BusinessNumber', ...definition.fields],
+      ...(definition.expand && { expand: definition.expand }),
       orderBy: definition.orderBy,
     },
     schema,
     paging,
     workflow,
   );
+  const sourceLanguage = language.toUpperCase();
   return {
     ...page,
     items: page.items.map((raw) => {
+      const meeting = raw.Subjects?.Meetings;
       if (
-        raw.Language !== language.toUpperCase() ||
-        (raw.BusinessNumber != null && String(raw.BusinessNumber) !== businessId)
+        raw.Language !== sourceLanguage ||
+        (raw.BusinessNumber != null && String(raw.BusinessNumber) !== businessId) ||
+        (raw.Subjects != null && raw.Subjects.Language !== sourceLanguage) ||
+        (meeting != null && meeting.Language !== sourceLanguage)
       )
         throw serializationError('Parliament returned a mismatched business relationship.');
       return {
@@ -343,6 +420,11 @@ export async function listBusinessSection(
         ...(raw.IdSubject !== undefined && { subjectId: raw.IdSubject, businessId }),
         ...(raw.SortOrder != null && { sortOrder: raw.SortOrder }),
         ...(raw.PublishedNotes != null && { publishedNotes: raw.PublishedNotes }),
+        // The normalized DateTime's own calendar day; no timezone is applied.
+        ...(meeting?.Date != null && { meetingDate: meeting.Date.slice(0, 10) }),
+        ...(meeting?.CouncilName != null && { councilName: meeting.CouncilName }),
+        ...(meeting?.IdSession != null && { sessionId: String(meeting.IdSession) }),
+        ...(meeting?.SessionName != null && { sessionName: meeting.SessionName }),
       };
     }),
   };

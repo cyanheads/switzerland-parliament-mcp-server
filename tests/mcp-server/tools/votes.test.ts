@@ -7,7 +7,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { getVotesTool } from '@/mcp-server/tools/definitions/get-votes.tool.js';
-import { parliamentHttp, textContent } from '../../helpers/parliament.js';
+import { parliamentHttp, resultBytes, textContent } from '../../helpers/parliament.js';
 import { expectVoteParity, voteRow, voteSummary, votingRow } from '../../helpers/vote-fixtures.js';
 
 if (!getVotesTool.enrichment) throw new Error('Vote enrichment contract must be declared.');
@@ -44,7 +44,12 @@ describe('chparl_get_votes', () => {
         BusinessNumber: 20991234,
         BusinessShortNumber: '99.1234',
         BusinessTitle: ' Original ',
+        BillTitle: ' Bill ',
+        RegistrationNumber: 33231,
         IdSession: 5107,
+        Subject: 'Classement',
+        MeaningYes: 'Oui',
+        MeaningNo: '',
         VoteEndWithTimezone: '/Date(0+0120)/',
         CantonID: 23,
         Canton: 'VD',
@@ -75,7 +80,12 @@ describe('chparl_get_votes', () => {
       'businessId',
       'businessShortNumber',
       'businessTitle',
+      'billTitle',
+      'registrationNumber',
       'sessionId',
+      'subject',
+      'meaningYes',
+      'meaningNo',
       'endTime',
     ])
       expect(output.members?.[0]).not.toHaveProperty(field);
@@ -93,7 +103,12 @@ describe('chparl_get_votes', () => {
         BusinessNumber: 20991234,
         BusinessShortNumber: '99.1234',
         BusinessTitle: ' Original ',
+        BillTitle: ' Bill [b] \\ *x* ',
+        RegistrationNumber: 33231,
         IdSession: 5107,
+        Subject: '<p>Original\r\nsubject</p>',
+        MeaningYes: 'Proposition de la majorité (ne pas donner suite)',
+        MeaningNo: 'Proposition de la minorité Dünki-Bättig (donner suite)',
         VoteEndWithTimezone: '/Date(0+0120)/',
       },
     ];
@@ -105,25 +120,98 @@ describe('chparl_get_votes', () => {
           businessId: '20991234',
           businessShortNumber: '99.1234',
           businessTitle: ' Original ',
+          billTitle: ' Bill [b] \\ *x* ',
+          registrationNumber: 33231,
           sessionId: '5107',
+          subject: '<p>Original\r\nsubject</p>',
+          meaningYes: 'Proposition de la majorité (ne pas donner suite)',
+          meaningNo: 'Proposition de la minorité Dünki-Bättig (donner suite)',
           endTime: '1970-01-01T02:00:00.000+02:00',
         },
       ],
     });
+    // History context sits in VoteSummary's relative order, between businessTitle and endTime.
+    const [row] = (result.structuredContent as { members: Record<string, unknown>[] }).members;
+    expect(Object.keys(row ?? {})).toEqual([
+      'votingId',
+      'voteId',
+      'businessId',
+      'businessShortNumber',
+      'businessTitle',
+      'billTitle',
+      'registrationNumber',
+      'sessionId',
+      'subject',
+      'meaningYes',
+      'meaningNo',
+      'endTime',
+      'personNumber',
+      'firstName',
+      'lastName',
+      'groupCode',
+      'groupName',
+      'decisionCode',
+      'decisionText',
+    ]);
     expect(result.structuredContent).not.toHaveProperty('vote');
-    expect(
-      new URL(http.calls[0]?.request.url ?? '').searchParams.get('$select')?.split(','),
-    ).toEqual(
-      expect.arrayContaining([
-        'BusinessNumber',
-        'BusinessShortNumber',
-        'BusinessTitle',
-        'IdSession',
-        'VoteEnd',
-        'VoteEndWithTimezone',
-      ]),
+    expect(http.calls).toHaveLength(1);
+    const url = new URL(http.calls[0]?.request.url ?? '');
+    expect(url.pathname).toBe('/odata.svc/Voting');
+    expect(url.searchParams.get('$select')).toBe(
+      'ID,Language,IdVote,PersonNumber,FirstName,LastName,CantonID,Canton,CantonName,ParlGroupCode,ParlGroupName,Decision,DecisionText,BusinessNumber,BusinessShortNumber,BusinessTitle,BillTitle,RegistrationNumber,IdSession,Subject,MeaningYes,MeaningNo,VoteEnd,VoteEndWithTimezone',
     );
-    expectVoteParity(result);
+    expect(expectVoteParity(result).strings).toContain('members[0].registrationNumber: 33231');
+  });
+
+  it('keeps empty published history context strings and omits null ones', async () => {
+    members = [
+      {
+        ID: 1,
+        Language: 'DE',
+        IdVote: 367,
+        PersonNumber: 1109,
+        BillTitle: '',
+        RegistrationNumber: 12,
+        Subject: '',
+        MeaningYes: '',
+        MeaningNo: '',
+      },
+      {
+        ID: 2,
+        Language: 'DE',
+        IdVote: 366,
+        PersonNumber: 1109,
+        BillTitle: null,
+        RegistrationNumber: null,
+        Subject: null,
+        MeaningYes: null,
+        MeaningNo: null,
+      },
+    ];
+    const result = await runToolContract(getVotesTool, { mode: 'members', personNumber: '1109' });
+    expect(getVotesTool.output.parse(result.structuredContent).members).toEqual([
+      {
+        votingId: '1',
+        voteId: '367',
+        billTitle: '',
+        registrationNumber: 12,
+        subject: '',
+        meaningYes: '',
+        meaningNo: '',
+        personNumber: '1109',
+      },
+      { votingId: '2', voteId: '366', personNumber: '1109' },
+    ]);
+    expect(http.calls).toHaveLength(1);
+    // content[] carries each empty string as a present, empty field and omits the null ones.
+    const lines = expectVoteParity(result).strings.map((line) => line.trimEnd());
+    for (const field of ['billTitle', 'subject', 'meaningYes', 'meaningNo'])
+      expect(lines).toContain(`members[0].${field}:`);
+    expect(lines.filter((line) => line.startsWith('members[1].'))).toEqual([
+      'members[1].votingId: 2',
+      'members[1].voteId: 366',
+      'members[1].personNumber: 1109',
+    ]);
   });
 
   it('publishes canonical canton IDs separately from raw Voting IDs on both surfaces', async () => {
@@ -306,7 +394,7 @@ describe('chparl_get_votes', () => {
     expectVoteParity(result);
   });
 
-  it('continues byte-fitted member history across source pages and recounts only delivered labels', async () => {
+  it('continues full member-history pages of large rows across source pages and recounts every delivered label', async () => {
     members = Array.from({ length: 8 }, (_, index) => ({
       ...votingRow(index + 1),
       PersonNumber: 1001,
@@ -327,38 +415,55 @@ describe('chparl_get_votes', () => {
       },
     });
     const deliveredIds: string[] = [];
+    const pageSizes: number[] = [];
     let offset = 0;
-    do {
+    // Eight rows at limit 5: one full page, then a short final page.
+    for (let call = 0; call < 2; call++) {
       const result = await runToolContract(getVotesTool, {
         mode: 'members',
         personNumber: '1001',
-        limit: 10_000,
+        limit: 5,
         offset,
       });
       expect(result.isError).not.toBe(true);
       const output = getVotesTool.output.parse(result.structuredContent);
       const page = output.members ?? [];
-      expect(page.length).toBeGreaterThan(0);
-      expect(page.length).toBeLessThan(8);
+      const published = members.slice(offset, offset + page.length).map((row) => row.DecisionText);
+      expect(page.map((row) => row.decisionText)).toEqual(published);
       expect(output.decisionCounts?.counts).toEqual([
-        {
-          decisionCode: 5,
-          count: page.length,
-          decisionTexts: members.slice(offset, offset + page.length).map((row) => row.DecisionText),
-        },
+        { decisionCode: 5, count: page.length, decisionTexts: published },
       ]);
-      deliveredIds.push(...page.map((row) => row.votingId));
       const wire = WireSchema.parse(result.structuredContent);
-      expect(wire.effectiveLimit).toBe(100);
-      expect(wire.totalCount).toBe(8);
-      expect(wire.returnedCount).toBe(page.length);
+      expect(wire).toMatchObject({ effectiveLimit: 5, totalCount: 8, returnedCount: page.length });
+      expect(wire.notice).toBeUndefined();
+      if (call === 0) expect(resultBytes(result)).toBeGreaterThan(24_000);
       expectVoteParity(result);
+      deliveredIds.push(...page.map((row) => row.votingId));
+      pageSizes.push(page.length);
       offset += page.length;
-      if (!wire.hasMore) break;
+      if (!wire.hasMore) {
+        expect(result.structuredContent).not.toHaveProperty('nextOffset');
+        break;
+      }
       expect(wire.nextOffset).toBe(offset);
-    } while (offset < 8);
+    }
+    expect(pageSizes).toEqual([5, 3]);
     expect(deliveredIds).toEqual(['1', '2', '3', '4', '5', '6', '7', '8']);
-    expect(http.calls.length).toBeGreaterThan(3);
+    const past = await runToolContract(getVotesTool, {
+      mode: 'members',
+      personNumber: '1001',
+      limit: 5,
+      offset: 8,
+    });
+    expect(past.structuredContent).toMatchObject({ members: [], totalCount: 8, hasMore: false });
+    expect(past.structuredContent).not.toHaveProperty('nextOffset');
+    expect(textContent(past)).toContain('past the last matching member decision');
+    expect(http.calls.map((call) => new URL(call.request.url).searchParams.get('$skip'))).toEqual([
+      '0',
+      '3',
+      '5',
+      '8',
+    ]);
   });
 
   it('preserves a supplied history business miss without querying unrelated votes', async () => {
@@ -412,30 +517,52 @@ describe('chparl_get_votes', () => {
     ['votes', 'businessId', 50],
     ['members', 'voteId', 100],
   ] as const)(
-    'requests the %s maximum and fits the complete response',
+    'requests the %s maximum and continues full clamped pages of large records to a short last page',
     async (mode, field, max) => {
-      votes = Array.from({ length: 50 }, (_, i) => ({
-        ID: 500 + i,
+      const large = `<p>${'原'.repeat(300)}</p>`;
+      votes = Array.from({ length: max + 10 }, (_, i) => ({
+        ID: 600 - i,
         Language: 'DE',
         BusinessNumber: 20991234,
+        BusinessTitle: `${large} ${i}`,
       }));
-      members = Array.from({ length: 100 }, (_, i) => ({ ID: i + 1, Language: 'DE', IdVote: 500 }));
-      const result = await runToolContract(getVotesTool, {
-        mode,
-        [field]: field === 'businessId' ? '20991234' : '500',
-        limit: 10_000,
-      });
-      expect(result.structuredContent).toMatchObject({
+      members = Array.from({ length: max + 10 }, (_, i) => ({
+        ID: i + 1,
+        Language: 'DE',
+        IdVote: 500,
+        DecisionText: `${large} ${i}`,
+      }));
+      const input = { mode, [field]: field === 'businessId' ? '20991234' : '500', limit: 10_000 };
+      const first = await runToolContract(getVotesTool, input);
+      expect(first.structuredContent).toMatchObject({
         effectiveLimit: max,
-        notice: expect.stringContaining(`clamped to ${max}`),
+        returnedCount: max,
+        totalCount: max + 10,
+        hasMore: true,
+        nextOffset: max,
+        notice: `Requested limit 10000 was clamped to ${max}.`,
       });
-      const delivered = getVotesTool.output.parse(result.structuredContent)[mode]?.length ?? 0;
-      expect(delivered).toBeGreaterThan(0);
-      expect(delivered).toBeLessThanOrEqual(max);
-      expect(WireSchema.parse(result.structuredContent).returnedCount).toBe(delivered);
-      expect(WireSchema.parse(result.structuredContent).hasMore).toBe(delivered < max);
+      expect(resultBytes(first)).toBeGreaterThan(24_000);
       expect(new URL(http.calls[1]?.request.url ?? '').searchParams.get('$top')).toBe(String(max));
-      expectVoteParity(result);
+      expectVoteParity(first);
+      const last = await runToolContract(getVotesTool, { ...input, offset: max });
+      expect(last.structuredContent).toMatchObject({
+        effectiveLimit: max,
+        returnedCount: 10,
+        totalCount: max + 10,
+        hasMore: false,
+      });
+      expect(last.structuredContent).not.toHaveProperty('nextOffset');
+      expectVoteParity(last);
+      const ids = [first, last].flatMap((result) => {
+        const output = getVotesTool.output.parse(result.structuredContent);
+        return mode === 'votes'
+          ? (output.votes ?? []).map((vote) => vote.voteId)
+          : (output.members ?? []).map((member) => member.votingId);
+      });
+      expect(ids).toEqual(
+        Array.from({ length: max + 10 }, (_, i) => String(mode === 'votes' ? 600 - i : i + 1)),
+      );
     },
   );
 
@@ -486,8 +613,8 @@ describe('chparl_get_votes', () => {
     expect(calls[0]?.searchParams.get('$orderby')).toBe('PersonNumber asc,ID asc');
   });
 
-  it('recomputes page buckets after byte fitting without shortening original decision strings', async () => {
-    members = Array.from({ length: 10 }, (_, i) => ({
+  it('counts page buckets over every row of a large selected-vote page without shortening original decision strings', async () => {
+    members = Array.from({ length: 12 }, (_, i) => ({
       ...votingRow(i + 1),
       DecisionText: `<p>${'原'.repeat(1000)}\r\n${i}</p>`,
     }));
@@ -498,26 +625,33 @@ describe('chparl_get_votes', () => {
       offset: 0,
     });
     const output = getVotesTool.output.parse(result.structuredContent);
-    const delivered = output.members ?? [];
-    expect(delivered.length).toBeGreaterThan(0);
-    expect(delivered.length).toBeLessThan(10);
-    expect(delivered.map((row) => row.decisionText)).toEqual(
-      members.slice(0, delivered.length).map((row) => row.DecisionText),
+    expect(output.members?.map((row) => row.decisionText)).toEqual(
+      members.slice(0, 10).map((row) => row.DecisionText),
     );
-    expect(output.decisionCounts?.counts.reduce((sum, count) => sum + count.count, 0)).toBe(
-      delivered.length,
-    );
+    expect(output.decisionCounts).toEqual({
+      scope: 'page',
+      counts: [
+        {
+          decisionCode: 1,
+          count: 5,
+          decisionTexts: members.filter((_, i) => i < 10 && i % 2 === 0).map((r) => r.DecisionText),
+        },
+        {
+          decisionCode: 2,
+          count: 5,
+          decisionTexts: members.filter((_, i) => i < 10 && i % 2 === 1).map((r) => r.DecisionText),
+        },
+      ],
+    });
     expect(result.structuredContent).toMatchObject({
-      returnedCount: delivered.length,
-      nextOffset: delivered.length,
-      totalCount: 10,
+      returnedCount: 10,
+      effectiveLimit: 10,
+      nextOffset: 10,
+      totalCount: 12,
       hasMore: true,
     });
-    expect(
-      new TextEncoder().encode(
-        JSON.stringify({ structuredContent: result.structuredContent, content: result.content }),
-      ).byteLength,
-    ).toBeLessThan(24_000);
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
     expectVoteParity(result);
   });
 
@@ -694,6 +828,7 @@ describe('chparl_get_votes', () => {
   });
 
   it('resolves blank optional fields before mode validation and applies member paging defaults', async () => {
+    members = Array.from({ length: 30 }, (_, i) => votingRow(i + 1));
     const result = await runToolContract(getVotesTool, {
       mode: 'members',
       voteId: '500',
@@ -703,16 +838,22 @@ describe('chparl_get_votes', () => {
     });
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent).toMatchObject({
-      effectiveFilters: { mode: 'members', voteId: '500', language: 'de', limit: 50, offset: 0 },
-      effectiveLimit: 50,
+      effectiveFilters: { mode: 'members', voteId: '500', language: 'de', limit: 25, offset: 0 },
+      effectiveLimit: 25,
+      returnedCount: 25,
+      totalCount: 30,
+      hasMore: true,
+      nextOffset: 25,
     });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(new URL(http.calls[1]?.request.url ?? '').searchParams.get('$top')).toBe('25');
     expect(WireSchema.parse(result.structuredContent).effectiveFilters).not.toHaveProperty(
       'personNumber',
     );
     expectVoteParity(result);
   });
 
-  it('retains a single oversized member decision whole with its exact filtered retrieval path', async () => {
+  it('returns a member decision larger than 24,000 bytes whole on a limit 1 page without a size notice', async () => {
     const original = `<p>${'原é'.repeat(8000)}\r\n</p>`;
     members = [{ ...votingRow(1), DecisionText: original }];
     const result = await runToolContract(getVotesTool, {
@@ -724,12 +865,12 @@ describe('chparl_get_votes', () => {
     expect(result.structuredContent).toMatchObject({
       members: [{ decisionText: original }],
       returnedCount: 1,
+      effectiveLimit: 1,
       hasMore: false,
       decisionCounts: { scope: 'page', counts: [{ decisionCode: 1, count: 1 }] },
     });
-    expect(textContent(result)).toContain(
-      'voteId=500, language=de, offset=0, limit=1, personNumber=1001',
-    );
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
     expectVoteParity(result);
   });
 

@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { internalError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   CouncilTermSchema,
+  MemberCommitteeHistorySchema,
   MemberCommitteeSchema,
   MemberInterestSchema,
   MemberPersonSchema,
@@ -20,14 +21,13 @@ import type { ODataPage } from '@/services/parliament/odata-client.js';
 import { ProvenanceSchema, provenance } from '@/services/parliament/provenance.js';
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import {
-  COLLECTION_RESULT_LIMIT_BYTES,
   clampNotice,
   completeResultBytes,
   fieldTrailer,
-  fitCollectionPage,
   formatParliamentResult,
   isPastEnd,
   joinNotices,
+  WHOLE_RESULT_NOTICE_BYTES,
 } from '../parliament-format.js';
 
 const service = new MemberService();
@@ -35,7 +35,7 @@ const MemberOutputSchema = z.object({
   found: z.boolean().describe('Whether a Person matched the requested PersonNumber and language.'),
   guidance: z.string().optional().describe('Discovery guidance when the person is absent.'),
   person: MemberPersonSchema.optional().describe(
-    'Resolved parliamentary identity, including the distinct Person.ID.',
+    'Resolved parliamentary identity, including its Person.ID.',
   ),
   section: MemberSectionSchema.describe('Profile component returned.'),
   memberships: z
@@ -52,7 +52,13 @@ const MemberOutputSchema = z.object({
     .array(MemberCommitteeSchema)
     .optional()
     .describe(
-      'Delivered published committee memberships; not a complete historical committee ledger.',
+      'Delivered current committee memberships; past memberships are in section committee_history.',
+    ),
+  committeeHistory: z
+    .array(MemberCommitteeHistorySchema)
+    .optional()
+    .describe(
+      'Delivered committee_history memberships, past and current, oldest first, each with the council recorded for it and its first and last day; a published row can name no committee.',
     ),
   interests: z
     .array(MemberInterestSchema)
@@ -111,7 +117,7 @@ const EMPTY_SECTION_NOTICE =
 /** Follow a PersonNumber through independent identity, term, committee, and interest workflows. */
 export const getMemberTool = tool('chparl_get_member', {
   description:
-    'Read a Swiss Parliament member by PersonNumber, which need not equal Person.ID. overview returns identity and every base MemberCouncil affiliation without pagination. Select council_terms for historical council terms, committees for published MemberCommittee rows, or interests for declared interests; those sections accept limit and offset. Missing paid status means unknown, and empty interests do not establish absence of conflicts of interest. Metadata labels remain in the selected language.',
+    'Read a Swiss Parliament member by PersonNumber. overview returns identity and every base MemberCouncil affiliation without pagination. Select council_terms for historical council terms, committees for current MemberCommittee memberships, committee_history for every published committee membership, past and current, with its first and last day, or interests for declared interests; those sections accept limit and offset. Missing paid status means unknown, and empty interests do not establish absence of conflicts of interest. Metadata labels remain in the selected language.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     personNumber: z
@@ -123,7 +129,7 @@ export const getMemberTool = tool('chparl_get_member', {
       'Metadata language: de (default), fr, or it; uppercase is accepted.',
     ),
     section: MemberSectionSchema.default('overview').describe(
-      'overview (default), council_terms, committees, or interests.',
+      'overview (default), council_terms, committees, committee_history, or interests.',
     ),
     limit: z
       .number()
@@ -153,7 +159,7 @@ export const getMemberTool = tool('chparl_get_member', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'Relationship pagination was supplied for overview.',
       recovery:
-        'Select council_terms, committees, or interests in chparl_get_member before supplying pagination.',
+        'Select council_terms, committees, committee_history, or interests in chparl_get_member before supplying pagination.',
     },
     {
       reason: 'upstream_rate_limited',
@@ -210,7 +216,7 @@ export const getMemberTool = tool('chparl_get_member', {
         };
         const oversized =
           completeResultBytes(output, { ...enrichment, ...(empty && { notice: empty }) }) >=
-          COLLECTION_RESULT_LIMIT_BYTES;
+          WHOLE_RESULT_NOTICE_BYTES;
         const notice = joinNotices(
           empty,
           oversized &&
@@ -220,34 +226,23 @@ export const getMemberTool = tool('chparl_get_member', {
         return output;
       }
       const finish = <T>(page: ODataPage<T>, build: (items: T[]) => MemberOutput): MemberOutput => {
-        const prepared = fitCollectionPage(page.items, (items, cut, oversized) => {
-          const hasMore = cut || page.hasMore;
-          const notice = joinNotices(
-            clampNotice(requestedLimit, paging.limit),
-            cut &&
-              'Response byte fitting returned fewer whole profile records. Continue with nextOffset; no record fields were shortened.',
-            items.length === 0 &&
-              (isPastEnd(page.totalCount, paging.offset)
-                ? `The requested offset is past this profile section. Call chparl_get_member with personNumber=${filters.personNumber}, section=${filters.section}, language=${filters.language}, and offset=0.`
-                : EMPTY_SECTION_NOTICE),
-            oversized &&
-              `One indivisible profile record or its provenance exceeds 24000 bytes. Retrieve it with chparl_get_member personNumber=${filters.personNumber}, section=${filters.section}, language=${filters.language}, offset=${paging.offset}, limit=1. The record is returned whole.`,
-          );
-          return {
-            output: build(items),
-            enrichment: {
-              effectiveFilters: filters,
-              returnedCount: items.length,
-              effectiveLimit: paging.limit,
-              ...(page.totalCount !== undefined && { totalCount: page.totalCount }),
-              ...(hasMore && { nextOffset: paging.offset + items.length }),
-              hasMore,
-              ...(notice !== undefined && { notice }),
-            },
-          };
+        const notice = joinNotices(
+          clampNotice(requestedLimit, paging.limit),
+          page.items.length === 0 &&
+            (isPastEnd(page.totalCount, paging.offset)
+              ? `The requested offset is past this profile section. Call chparl_get_member with personNumber=${filters.personNumber}, section=${filters.section}, language=${filters.language}, and offset=0.`
+              : EMPTY_SECTION_NOTICE),
+        );
+        ctx.enrich({
+          effectiveFilters: filters,
+          returnedCount: page.items.length,
+          effectiveLimit: paging.limit,
+          ...(page.totalCount !== undefined && { totalCount: page.totalCount }),
+          ...(page.nextOffset !== undefined && { nextOffset: page.nextOffset }),
+          hasMore: page.hasMore,
+          ...(notice !== undefined && { notice }),
         });
-        ctx.enrich(prepared.enrichment);
-        return prepared.output;
+        return build(page.items);
       };
       const base = () => ({
         found: true,
@@ -265,6 +260,16 @@ export const getMemberTool = tool('chparl_get_member', {
           return finish(
             await service.committees(filters.personNumber, filters.language, paging, workflow),
             (committees) => ({ ...base(), committees }),
+          );
+        case 'committee_history':
+          return finish(
+            await service.committeeHistory(
+              filters.personNumber,
+              filters.language,
+              paging,
+              workflow,
+            ),
+            (committeeHistory) => ({ ...base(), committeeHistory }),
           );
         case 'interests':
           return finish(

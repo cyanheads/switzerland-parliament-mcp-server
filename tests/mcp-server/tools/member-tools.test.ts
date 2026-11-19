@@ -5,13 +5,16 @@
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getMemberTool } from '@/mcp-server/tools/definitions/get-member.tool.js';
 import { searchMembersTool } from '@/mcp-server/tools/definitions/search-members.tool.js';
 import {
+  committeeHistoryRow,
   committeeRow,
   expectMemberParity,
+  historyRosterRow,
   interestRow,
+  interestSearchRow,
   memberGuid,
   memberRow,
   personRow,
@@ -71,6 +74,71 @@ function serveRosters(
       });
     },
   });
+}
+
+/** Serve MemberCommitteeHistory rows for one roster, and which Committee rows exist. */
+function serveHistory(rows: readonly object[], committees: readonly string[] = ['12']) {
+  http.reset();
+  http.route({
+    match: () => true,
+    respond: (request) => {
+      const url = new URL(request.url);
+      if (url.pathname === '/odata.svc/Committee') {
+        const number = /CommitteeNumber eq (\d+)/.exec(url.searchParams.get('$filter') ?? '')?.[1];
+        return Response.json({ d: number && committees.includes(number) ? [{ ID: 1 }] : [] });
+      }
+      if (url.pathname !== '/odata.svc/MemberCommitteeHistory')
+        throw new Error(`Unexpected ${url.pathname} request.`);
+      const offset = Number(url.searchParams.get('$skip'));
+      const limit = Number(url.searchParams.get('$top'));
+      return Response.json({
+        d: { results: rows.slice(offset, offset + limit), __count: String(rows.length) },
+      });
+    },
+  });
+}
+
+/** Synthetic roster on a past day, each membership with its own recorded affiliation. */
+function historyRoster(size: number) {
+  return Array.from({ length: size }, (_, index) =>
+    historyRosterRow(
+      { ID: memberGuid(4100 + index), PersonNumber: 5100 + index },
+      { ID: 5100 + index, PersonNumber: 5100 + index },
+    ),
+  );
+}
+
+/** Serve PersonInterest declarations with their declarants; any other entity is unexpected. */
+function serveInterests(rows: readonly object[]) {
+  http.reset();
+  http.route({
+    match: () => true,
+    respond: (request) => {
+      const url = new URL(request.url);
+      if (url.pathname !== '/odata.svc/PersonInterest')
+        throw new Error(`Unexpected ${url.pathname} request.`);
+      const offset = Number(url.searchParams.get('$skip'));
+      const limit = Number(url.searchParams.get('$top'));
+      return Response.json({
+        d: { results: rows.slice(offset, offset + limit), __count: String(rows.length) },
+      });
+    },
+  });
+}
+
+/** Synthetic declarations, two per declarant, ordered as the source orders them. */
+function declarations(size: number) {
+  return Array.from({ length: size }, (_, index) =>
+    interestSearchRow(
+      {
+        ID: memberGuid(7000 + index),
+        PersonNumber: 6000 + Math.floor(index / 2),
+        InterestName: `Groupe de réflexion Groupe Mutuel ${index}`,
+        SortOrder: index % 2,
+      },
+      { ID: 6000 + Math.floor(index / 2), PersonNumber: 6000 + Math.floor(index / 2) },
+    ),
+  );
 }
 
 function requestedPaths(): string[] {
@@ -199,6 +267,7 @@ describe('chparl_search_members', () => {
     ['s', 'S', 2],
     ['Ständerat', 'S', 2],
     ['Conseil des États', 'S', 2],
+    ['Conseil des Etats', 'S', 2],
     ['Consiglio degli Stati', 'S', 2],
   ] as const)('normalizes council alias %s before querying', async (council, normalized, id) => {
     serveRows([]);
@@ -327,45 +396,59 @@ describe('chparl_search_members', () => {
     expectMemberParity(last);
   });
 
-  it('fits a maximum source page by whole names and resumes from delivered rows', async () => {
+  it('returns a full 100-record page of large names, then the short last page and the past-end offset', async () => {
     const name = `<p>${'原'.repeat(180)}\r\n\tZoë \\ ${'`'.repeat(4)}</p>`;
-    const rows = Array.from({ length: 100 }, (_, index) =>
+    const rows = Array.from({ length: 150 }, (_, index) =>
       memberRow({ ID: index + 1, OfficialName: `${name}${index}` }),
     );
     serveRows(rows);
-    const result = await runToolContract(searchMembersTool, { limit: 100 });
-    const output = searchMembersTool.output.parse(result.structuredContent);
-    expect(output.members.length).toBeGreaterThan(0);
-    expect(output.members.length).toBeLessThan(100);
-    expect(output.members.map((row) => row.officialName)).toEqual(
-      rows.slice(0, output.members.length).map((row) => row.OfficialName),
-    );
-    expect(result.structuredContent).toMatchObject({
-      returnedCount: output.members.length,
-      nextOffset: output.members.length,
-      totalCount: 100,
-      effectiveLimit: 100,
-      hasMore: true,
-      notice: expect.stringContaining('no record fields were shortened'),
+    const delivered: (string | undefined)[] = [];
+    for (const [offset, size, nextOffset] of [
+      [0, 100, 100],
+      [100, 50, undefined],
+    ] as const) {
+      const result = await runToolContract(searchMembersTool, { limit: 100, offset });
+      const output = searchMembersTool.output.parse(result.structuredContent);
+      expect(output.members).toHaveLength(size);
+      expect(result.structuredContent).toMatchObject({
+        returnedCount: size,
+        totalCount: 150,
+        effectiveLimit: 100,
+        hasMore: nextOffset !== undefined,
+        ...(nextOffset !== undefined && { nextOffset }),
+      });
+      if (nextOffset === undefined)
+        expect(result.structuredContent).not.toHaveProperty('nextOffset');
+      expect(result.structuredContent).not.toHaveProperty('notice');
+      expect(resultBytes(result)).toBeGreaterThan(24_000);
+      expectMemberParity(result);
+      delivered.push(...output.members.map((row) => row.officialName));
+    }
+    expect(delivered).toEqual(rows.map((row) => row.OfficialName));
+
+    const past = await runToolContract(searchMembersTool, { limit: 100, offset: 150 });
+    expect(past.structuredContent).toMatchObject({
+      members: [],
+      returnedCount: 0,
+      totalCount: 150,
+      hasMore: false,
+      notice: expect.stringContaining('past the last matching member record'),
     });
-    expect(
-      new TextEncoder().encode(
-        JSON.stringify({ structuredContent: result.structuredContent, content: result.content }),
-      ).byteLength,
-    ).toBeLessThan(24_000);
-    expectMemberParity(result);
+    expect(http.calls).toHaveLength(3);
   });
 
-  it('preserves one oversized original member name and exposes its exact retry path', async () => {
+  it('returns a record over 24000 bytes whole on a limit 1 page with no size notice', async () => {
     const name = `<p>${'字'.repeat(10_000)}\r\n</p>`;
-    serveRows([memberRow({ OfficialName: name })]);
+    serveRows([memberRow({ OfficialName: name }), memberRow({ ID: 802 })]);
     const result = await runToolContract(searchMembersTool, { limit: 1 });
     expect(result.structuredContent).toMatchObject({
       members: [{ officialName: name }],
       returnedCount: 1,
-      hasMore: false,
-      notice: expect.stringContaining('offset=0 and limit=1'),
+      nextOffset: 1,
+      hasMore: true,
     });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
     expectMemberParity(result);
   });
 
@@ -418,29 +501,51 @@ describe('chparl_search_members committee rosters', () => {
     expectMemberParity(result);
   });
 
-  it('walks a byte-fitted 25-membership roster once each and then reports the past-end offset', async () => {
+  it('returns the whole 25-membership roster on one limit 30 page', async () => {
+    const rows = roster(25);
+    serveRosters({ '12': rows });
+    const result = await runToolContract(searchMembersTool, { committeeId: '12', limit: 30 });
+    const output = searchMembersTool.output.parse(result.structuredContent);
+    expect(output.members.map((row) => row.memberCouncilId)).toEqual(
+      rows.map((row) => String(row.MembersCouncil.ID)),
+    );
+    expect(result.structuredContent).toMatchObject({
+      committeeFound: true,
+      returnedCount: 25,
+      totalCount: 25,
+      hasMore: false,
+    });
+    expect(result.structuredContent).not.toHaveProperty('nextOffset');
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expectMemberParity(result);
+  });
+
+  it('walks a 25-membership roster in limit 10 pages once each and then reports the past-end offset', async () => {
     const rows = roster(25);
     serveRosters({ '12': rows });
     const delivered: string[] = [];
-    let offset: number | undefined = 0;
-    let pages = 0;
-    while (offset !== undefined) {
+    for (const [offset, size, nextOffset] of [
+      [0, 10, 10],
+      [10, 10, 20],
+      [20, 5, undefined],
+    ] as const) {
       const result = await runToolContract(searchMembersTool, {
         committeeId: '12',
-        limit: 30,
+        limit: 10,
         offset,
       });
       const output = searchMembersTool.output.parse(result.structuredContent);
-      expect(result.structuredContent).toMatchObject({ committeeFound: true, totalCount: 25 });
-      expect(resultBytes(result)).toBeLessThan(24_000);
+      expect(output.members).toHaveLength(size);
+      expect(result.structuredContent).toMatchObject({
+        committeeFound: true,
+        totalCount: 25,
+        hasMore: nextOffset !== undefined,
+      });
+      expect((result.structuredContent as { nextOffset?: number }).nextOffset).toBe(nextOffset);
+      expect(result.structuredContent).not.toHaveProperty('notice');
       expectMemberParity(result);
       delivered.push(...output.members.map((row) => row.memberCouncilId));
-      const { nextOffset } = result.structuredContent as { nextOffset?: number };
-      if (nextOffset !== undefined) expect(nextOffset).toBe(offset + output.members.length);
-      offset = nextOffset;
-      pages++;
     }
-    expect(pages).toBeGreaterThan(1);
     expect(delivered).toEqual(rows.map((row) => String(row.MembersCouncil.ID)));
 
     const past = await runToolContract(searchMembersTool, { committeeId: '12', offset: 25 });
@@ -549,32 +654,44 @@ describe('chparl_search_members committee rosters', () => {
     const { notice } = result.structuredContent as { notice: string };
     expect(notice.startsWith('Requested limit 10000 was clamped to 100. ')).toBe(true);
     expect(notice).toContain('This committee exists but has no published members');
+    expect(notice).toContain('Pass asOf');
     expect(notice).not.toContain('membership');
     expect(result.structuredContent).not.toHaveProperty('guidance');
     expectMemberParity(result);
   });
 
-  it.each(['former', 'all'] as const)(
-    'rejects membership %s with committeeId as incompatible_fields before any request',
-    async (membership) => {
-      const result = await runToolContract(searchMembersTool, { committeeId: '12', membership });
-      expect(JsonRpcErrorCode.ValidationError).toBe(-32007);
-      expect(result.structuredContent).toMatchObject({
-        error: {
-          code: JsonRpcErrorCode.ValidationError,
-          data: {
-            reason: 'incompatible_fields',
-            recovery: {
-              hint: expect.stringContaining('Committee rosters list current members only'),
-            },
+  it.each([
+    [{ committeeId: '12', membership: 'former' }, 'membership current only'],
+    [{ committeeId: '12', membership: 'all' }, 'membership current only'],
+    [{ committeeId: '12', asOf: '2014-03-03', membership: 'all' }, 'membership current only'],
+    [{ asOf: '2014-03-03' }, 'asOf needs committeeId'],
+    [{ asOf: '2014-03-03', membership: 'former' }, 'asOf needs committeeId'],
+    [{ interest: 'Groupe Mutuel', committeeId: '12' }, 'interest cannot be combined'],
+    [{ interest: 'Groupe Mutuel', asOf: '2014-03-03' }, 'interest cannot be combined'],
+    [
+      { interest: 'Groupe Mutuel', committeeId: '12', asOf: '2014-03-03', membership: 'all' },
+      'interest cannot be combined',
+    ],
+  ] as const)('rejects %o as incompatible_fields before any request', async (input, message) => {
+    const result = await runToolContract(searchMembersTool, input);
+    expect(JsonRpcErrorCode.ValidationError).toBe(-32007);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringContaining(message),
+        data: {
+          reason: 'incompatible_fields',
+          recovery: {
+            hint: expect.stringContaining('Committee rosters take membership current only'),
           },
         },
-      });
-      expect(textContent(result)).toContain('incompatible_fields');
-      expect(textContent(result)).toContain('Committee rosters list current members only');
-      expect(http.calls).toHaveLength(0);
-    },
-  );
+      },
+    });
+    expect(textContent(result)).toContain('incompatible_fields');
+    expect(textContent(result)).toContain(message);
+    expect(textContent(result)).toContain('Committee rosters take membership current only');
+    expect(http.calls).toHaveLength(0);
+  });
 
   it('fails a roster row without its MemberCouncil expansion as a serialization error', async () => {
     serveRosters({ '12': [rosterRow({ MembersCouncil: undefined })] });
@@ -583,6 +700,311 @@ describe('chparl_search_members committee rosters', () => {
       error: { code: JsonRpcErrorCode.SerializationError },
     });
     expect(requestedPaths()).toEqual(['/odata.svc/MemberCommittee']);
+  });
+});
+
+describe('chparl_search_members committee rosters on a past day', () => {
+  afterEach(() => vi.useRealTimers());
+
+  const onDay = (day: string) =>
+    `Language eq 'DE' and (CommitteeNumber eq 12 and DateJoining le datetime'${day}T23:59:59.999' and (DateLeaving ge datetime'${day}T00:00:00' or DateLeaving eq null))`;
+
+  it('carries each membership as recorded on asOf, with its committee dates, on both surfaces', async () => {
+    serveHistory(historyRoster(25));
+    const result = await runToolContract(searchMembersTool, {
+      committeeId: '12',
+      asOf: '2014-03-03',
+      limit: 2,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      committeeFound: true,
+      members: [
+        {
+          memberCouncilId: '5100',
+          personNumber: '5100',
+          sourceUrl:
+            "https://ws.parlament.ch/odata.svc/MemberCommitteeHistory(ID=guid'00000000-0000-4000-8000-000000004100',Language='DE')",
+          officialName: "Zoë D'Essai",
+          councilId: '1',
+          partyId: '14',
+          groupId: '3',
+          groupAbbreviation: 'Fraktion CE',
+          committeeFunctionId: 1,
+          committeeFunctionName: 'Mitglied',
+          committeeJoinedDate: '2011-12-15T00:00:00.000',
+          committeeLeftDate: '2014-03-09T00:00:00.000',
+        },
+        { memberCouncilId: '5101' },
+      ],
+      effectiveFilters: { committeeId: '12', asOf: '2014-03-03', membership: 'current' },
+      returnedCount: 2,
+      totalCount: 25,
+      nextOffset: 2,
+      hasMore: true,
+    });
+    const output = searchMembersTool.output.parse(result.structuredContent);
+    for (const field of ['active', 'joinedDate', 'leftDate'])
+      expect(output.members[0]).not.toHaveProperty(field);
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(http.calls.map((call) => new URL(call.request.url).searchParams.get('$filter'))).toEqual(
+      [onDay('2014-03-03')],
+    );
+    expectMemberParity(result);
+  });
+
+  it.each(['2014-03-03', ' 2014-03-03T00:00:00.000 ', '2014-03-03T23:59:59.999+01:00'])(
+    'reads asOf %s as its day and echoes the day',
+    async (asOf) => {
+      serveHistory(historyRoster(1));
+      const result = await runToolContract(searchMembersTool, { committeeId: '12', asOf });
+      expect(result.structuredContent).toMatchObject({
+        effectiveFilters: { asOf: '2014-03-03' },
+        returnedCount: 1,
+      });
+      expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$filter')).toBe(
+        onDay('2014-03-03'),
+      );
+      expectMemberParity(result);
+    },
+  );
+
+  it.each([
+    ['2026-11-19T12:00:00Z', '2026-11-20', true],
+    ['2026-11-19T22:59:59Z', '2026-11-20', true],
+    ['2026-11-19T23:00:00Z', '2026-11-20', false],
+    ['2026-11-19T12:00:00Z', '2026-11-19T12:00:00.000', false],
+    ['2026-11-19T12:00:00Z', '2027-01-01', true],
+  ] as const)(
+    'at %s judges asOf %s against today in Switzerland (future: %s)',
+    async (now, asOf, future) => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date(now));
+      serveHistory(historyRoster(1));
+      const result = await runToolContract(searchMembersTool, { committeeId: '12', asOf });
+      if (!future) {
+        expect(result.isError).not.toBe(true);
+        expect(requestedPaths()).toEqual(['/odata.svc/MemberCommitteeHistory']);
+        return;
+      }
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'as_of_in_future',
+            recovery: { hint: expect.stringContaining('today or an earlier day') },
+          },
+        },
+      });
+      expect(textContent(result)).toContain('as_of_in_future');
+      expect(http.calls).toHaveLength(0);
+    },
+  );
+
+  it('returns an empty roster before the committee’s published history with the coverage notice', async () => {
+    serveHistory([]);
+    const result = await runToolContract(searchMembersTool, {
+      committeeId: '12',
+      asOf: '1995-12-03',
+    });
+    expect(result.structuredContent).toMatchObject({
+      members: [],
+      committeeFound: true,
+      totalCount: 0,
+      hasMore: false,
+      effectiveFilters: { asOf: '1995-12-03' },
+      notice: expect.stringContaining('1995-12-04 for standing committees'),
+    });
+    const { notice } = result.structuredContent as { notice: string };
+    expect(notice).toContain('No membership of this committee is published for 1995-12-03');
+    expect(notice).not.toContain('membership all');
+    expect(result.structuredContent).not.toHaveProperty('guidance');
+    expect(requestedPaths()).toEqual(['/odata.svc/MemberCommitteeHistory', '/odata.svc/Committee']);
+    expectMemberParity(result);
+  });
+
+  it('explains a narrowed miss on asOf without the coverage notice', async () => {
+    serveHistory([]);
+    const result = await runToolContract(searchMembersTool, {
+      committeeId: '12',
+      asOf: '2014-03-03',
+      council: 'S',
+    });
+    expect(result.structuredContent).toMatchObject({
+      members: [],
+      committeeFound: true,
+      notice: expect.stringContaining(
+        'No members of this committee on 2014-03-03 matched these filters',
+      ),
+    });
+    expect((result.structuredContent as { notice: string }).notice).not.toContain('1995-12-04');
+    expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$filter')).toBe(
+      onDay('2014-03-03').replace(/\)$/, ' and Council eq 2)'),
+    );
+    expectMemberParity(result);
+  });
+
+  it('reports an unknown committee on asOf as committeeFound false with guidance only', async () => {
+    serveHistory([], []);
+    const result = await runToolContract(searchMembersTool, {
+      committeeId: '999999',
+      asOf: '2014-03-03',
+    });
+    expect(result.structuredContent).toMatchObject({
+      members: [],
+      committeeFound: false,
+      guidance:
+        'No committee matched this committeeId. Use chparl_list_reference with topic committees to discover a valid committeeId.',
+    });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expectMemberParity(result);
+  });
+
+  it('walks a past roster in limit 10 pages once each and reports the past-end offset', async () => {
+    const rows = historyRoster(25);
+    serveHistory(rows);
+    const delivered: string[] = [];
+    for (const [offset, size, nextOffset] of [
+      [0, 10, 10],
+      [10, 10, 20],
+      [20, 5, undefined],
+    ] as const) {
+      const result = await runToolContract(searchMembersTool, {
+        committeeId: '12',
+        asOf: '2014-03-03',
+        limit: 10,
+        offset,
+      });
+      const output = searchMembersTool.output.parse(result.structuredContent);
+      expect(output.members).toHaveLength(size);
+      expect((result.structuredContent as { nextOffset?: number }).nextOffset).toBe(nextOffset);
+      delivered.push(...output.members.map((row) => row.sourceUrl));
+    }
+    expect(delivered).toHaveLength(25);
+    expect(new Set(delivered).size).toBe(25);
+    const past = await runToolContract(searchMembersTool, {
+      committeeId: '12',
+      asOf: '2014-03-03',
+      offset: 25,
+    });
+    expect(past.structuredContent).toMatchObject({
+      members: [],
+      committeeFound: true,
+      notice: expect.stringContaining('past the last matching member record'),
+    });
+    expect(new Set(requestedPaths())).toEqual(new Set(['/odata.svc/MemberCommitteeHistory']));
+  });
+});
+
+describe('chparl_search_members declared-interest searches', () => {
+  it('returns one declaration per row with the declarant’s record on both surfaces', async () => {
+    serveInterests(declarations(25));
+    const result = await runToolContract(searchMembersTool, {
+      interest: '  groupe MUTUEL ',
+      council: 'S',
+      limit: 2,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      members: [
+        {
+          memberCouncilId: '6000',
+          personNumber: '6000',
+          sourceUrl: "https://ws.parlament.ch/odata.svc/MemberCouncil(ID=6000,Language='DE')",
+          active: true,
+          interest: {
+            id: memberGuid(7000),
+            interestName: 'Groupe de réflexion Groupe Mutuel 0',
+            paid: false,
+            dateFrom: '2023-02-15T00:00:00.000',
+            sourceUrl:
+              "https://ws.parlament.ch/odata.svc/PersonInterest(ID=guid'00000000-0000-4000-8000-000000007000',Language='DE')",
+          },
+        },
+        { memberCouncilId: '6000', interest: { id: memberGuid(7001), sortOrder: 1 } },
+      ],
+      effectiveFilters: { interest: 'groupe MUTUEL', council: 'S', membership: 'current' },
+      returnedCount: 2,
+      totalCount: 25,
+      nextOffset: 2,
+      hasMore: true,
+    });
+    expect(result.structuredContent).not.toHaveProperty('committeeFound');
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$filter')).toBe(
+      "Language eq 'DE' and (substringof('groupe MUTUEL',InterestName) and Persons/MembersCouncil/Active eq true and Persons/MembersCouncil/Council eq 2)",
+    );
+    expect(textContent(result)).toContain(
+      '**members\\[0\\].interest.interestName:** Groupe de réflexion Groupe Mutuel 0',
+    );
+    expect(textContent(result)).toContain(
+      '**members\\[0\\].interest.dateFrom:** 2023-02-15T00:00:00.000',
+    );
+    expectMemberParity(result);
+  });
+
+  it('walks 25 declarations in limit 10 pages once each and reports the past-end offset', async () => {
+    const rows = declarations(25);
+    serveInterests(rows);
+    const delivered: (string | undefined)[] = [];
+    for (const [offset, size, nextOffset] of [
+      [0, 10, 10],
+      [10, 10, 20],
+      [20, 5, undefined],
+    ] as const) {
+      const result = await runToolContract(searchMembersTool, {
+        interest: 'Groupe Mutuel',
+        membership: 'all',
+        limit: 10,
+        offset,
+      });
+      const output = searchMembersTool.output.parse(result.structuredContent);
+      expect(output.members).toHaveLength(size);
+      expect(result.structuredContent).toMatchObject({ totalCount: 25 });
+      expect((result.structuredContent as { nextOffset?: number }).nextOffset).toBe(nextOffset);
+      delivered.push(...output.members.map((row) => row.interest?.id));
+    }
+    expect(delivered).toEqual(rows.map((row) => row.ID));
+    const past = await runToolContract(searchMembersTool, {
+      interest: 'Groupe Mutuel',
+      membership: 'all',
+      offset: 25,
+    });
+    expect(past.structuredContent).toMatchObject({
+      members: [],
+      totalCount: 25,
+      notice: expect.stringContaining('past the last matching member record'),
+    });
+  });
+
+  it('explains a zero-hit interest search without claiming that no member has the tie', async () => {
+    serveInterests([]);
+    const result = await runToolContract(searchMembersTool, { interest: 'Groupe Mutuel' });
+    expect(result.structuredContent).toMatchObject({ members: [], totalCount: 0, hasMore: false });
+    const { notice } = result.structuredContent as { notice: string };
+    expect(notice).toContain('No declared interest matched');
+    expect(notice).toContain('as declared in another language');
+    expect(notice).toContain('membership all');
+    expect(notice).toContain('does not establish that no member has a tie');
+    expect(notice).not.toContain('No member records matched');
+    expect(requestedPaths()).toEqual(['/odata.svc/PersonInterest']);
+    expectMemberParity(result);
+  });
+
+  it('sends a 255-character interest with every other filter at maximum identifier width', async () => {
+    serveInterests([]);
+    const result = await runToolContract(searchMembersTool, {
+      interest: 'a'.repeat(255),
+      membership: 'all',
+      council: 'S',
+      cantonId: '2147483647',
+      partyId: '2147483647',
+      groupId: '2147483647',
+      language: 'fr',
+    });
+    expect(result.isError).not.toBe(true);
+    expect(http.calls).toHaveLength(1);
+    expect(new URL(http.calls[0]?.request.url ?? '').search.length - 1).toBeLessThanOrEqual(2048);
   });
 });
 
@@ -595,6 +1017,12 @@ const sections = [
       memberRow({ ID: memberGuid(3), IdPredecessor: memberGuid(4), ...overrides }),
   },
   { section: 'committees', field: 'committees', entity: 'MemberCommittee', row: committeeRow },
+  {
+    section: 'committee_history',
+    field: 'committeeHistory',
+    entity: 'MemberCommitteeHistory',
+    row: committeeHistoryRow,
+  },
   { section: 'interests', field: 'interests', entity: 'PersonInterest', row: interestRow },
 ] as const;
 
@@ -662,7 +1090,7 @@ describe('chparl_get_member', () => {
     expectMemberParity(result);
   });
 
-  it.each(['overview', 'council_terms', 'committees', 'interests'] as const)(
+  it.each(['overview', 'council_terms', 'committees', 'committee_history', 'interests'] as const)(
     'distinguishes missing Person from empty %s',
     async (section) => {
       http.reset();
@@ -683,6 +1111,7 @@ describe('chparl_get_member', () => {
         'memberships',
         'councilTerms',
         'committees',
+        'committeeHistory',
         'interests',
         'returnedCount',
         'hasMore',
@@ -797,45 +1226,64 @@ describe('chparl_get_member', () => {
   );
 
   it.each(sections)(
-    'fits whole $section rows from maximum pages without changing original fields',
+    'returns a full 100-row $section page of large rows unchanged, then the short last page and the past-end offset',
     async ({ section, field, row }) => {
       const original = `<p>${'原'.repeat(250)}\r\n\t</p>`;
-      const rows = Array.from({ length: 100 }, (_, index) =>
+      const rows = Array.from({ length: 150 }, (_, index) =>
         row({
           ID: memberGuid(index + 1),
-          OfficialName: original,
-          CommitteeName: original,
-          InterestName: original,
+          OfficialName: `${original}${index}`,
+          CommitteeName: `${original}${index}`,
+          InterestName: `${original}${index}`,
         }),
       );
       serveRows(rows);
-      const result = await runToolContract(getMemberTool, {
+      const delivered: string[] = [];
+      for (const [offset, size, nextOffset] of [
+        [0, 100, 100],
+        [100, 50, undefined],
+      ] as const) {
+        const result = await runToolContract(getMemberTool, {
+          personNumber: '91',
+          section,
+          limit: 100,
+          offset,
+        });
+        expect(result.isError).not.toBe(true);
+        const records: { id: string }[] =
+          getMemberTool.output.parse(result.structuredContent)[field] ?? [];
+        expect(records).toHaveLength(size);
+        expect(result.structuredContent).toMatchObject({
+          returnedCount: size,
+          effectiveLimit: 100,
+          totalCount: 150,
+          hasMore: nextOffset !== undefined,
+          ...(nextOffset !== undefined && { nextOffset }),
+        });
+        if (nextOffset === undefined)
+          expect(result.structuredContent).not.toHaveProperty('nextOffset');
+        expect(result.structuredContent).not.toHaveProperty('notice');
+        expect(resultBytes(result)).toBeGreaterThan(24_000);
+        expect(decodeParliamentMarkdown(textContent(result)).strings).toContain(
+          `${original}${offset + size - 1}`,
+        );
+        expectMemberParity(result);
+        delivered.push(...records.map((record) => record.id));
+      }
+      expect(delivered).toEqual(rows.map((source) => source.ID));
+      const past = await runToolContract(getMemberTool, {
         personNumber: '91',
         section,
         limit: 100,
+        offset: 150,
       });
-      expect(result.isError).not.toBe(true);
-      const output = getMemberTool.output.parse(result.structuredContent);
-      const records = output.councilTerms ?? output.committees ?? output.interests ?? [];
-      expect(records.length).toBeGreaterThan(0);
-      expect(records.length).toBeLessThan(100);
-      expect(result.structuredContent).toMatchObject({
-        returnedCount: records.length,
-        effectiveLimit: 100,
-        totalCount: 100,
-        nextOffset: records.length,
-        hasMore: true,
-        notice: expect.stringContaining('no record fields were shortened'),
+      expect(past.structuredContent).toMatchObject({
+        [field]: [],
+        returnedCount: 0,
+        totalCount: 150,
+        hasMore: false,
+        notice: expect.stringContaining('past this profile section'),
       });
-      expect(
-        new TextEncoder().encode(
-          JSON.stringify({ structuredContent: result.structuredContent, content: result.content }),
-        ).byteLength,
-      ).toBeLessThan(24_000);
-      const decoded = decodeParliamentMarkdown(textContent(result));
-      expect(decoded.strings).toContain(original);
-      expect(output[field]).toHaveLength(records.length);
-      expectMemberParity(result);
     },
   );
 
@@ -860,16 +1308,86 @@ describe('chparl_get_member', () => {
       lastName: '',
       officialName: original,
     });
-    expect(output.interests?.[0]).toMatchObject({ interestName: original, paid: false });
+    expect(output.interests?.[0]).toMatchObject({
+      interestName: original,
+      paid: false,
+      dateFrom: '2023-02-15T00:00:00.000',
+    });
+    expect(textContent(result)).toContain('**interests\\[0\\].dateFrom:** 2023-02-15T00:00:00.000');
     expect(output.interests?.[1]).toHaveProperty('interestName', '');
     expect(output.interests?.[1]).not.toHaveProperty('paid');
+    expect(output.interests?.[1]).not.toHaveProperty('dateFrom');
     expect(output.interests?.[2]).not.toHaveProperty('paid');
     expectMemberParity(result);
   });
 
-  it('returns one indivisible oversized interest with exact retrieval guidance', async () => {
+  it('returns committee_history oldest first, a row naming no committee included, on both surfaces', async () => {
+    serveRows([
+      {
+        ID: memberGuid(6),
+        PersonNumber: 91,
+        Language: 'DE',
+        CommitteeNumber: null,
+        CommitteeName: null,
+        CommitteeFunction: null,
+        DateJoining: null,
+        DateLeaving: null,
+        Council: 1,
+        CouncilName: 'Nationalrat',
+        CouncilAbbreviation: 'NR',
+      },
+      committeeHistoryRow(),
+      committeeHistoryRow({
+        ID: memberGuid(7),
+        DateJoining: '/Date(1701648000000)/',
+        DateLeaving: null,
+      }),
+    ]);
+    const result = await runToolContract(getMemberTool, {
+      personNumber: '91',
+      section: 'committee_history',
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      found: true,
+      section: 'committee_history',
+      committeeHistory: [
+        {
+          id: memberGuid(6),
+          councilId: '1',
+          sourceUrl:
+            "https://ws.parlament.ch/odata.svc/MemberCommitteeHistory(ID=guid'00000000-0000-4000-8000-000000000006',Language='DE')",
+        },
+        {
+          id: memberGuid(5),
+          committeeId: '10',
+          abbreviation: 'CH-NR',
+          abbreviation1: 'CH-N',
+          functionId: 0,
+          functionName: 'Mitglied',
+          joinedDate: '2011-12-15T00:00:00.000',
+          leftDate: '2015-11-29T00:00:00.000',
+        },
+        { id: memberGuid(7), committeeId: '10', joinedDate: '2023-12-04T00:00:00.000' },
+      ],
+      returnedCount: 3,
+      totalCount: 3,
+      hasMore: false,
+    });
+    const rows = getMemberTool.output.parse(result.structuredContent).committeeHistory;
+    for (const field of ['committeeId', 'committeeName', 'functionId', 'joinedDate', 'leftDate'])
+      expect(rows?.[0]).not.toHaveProperty(field);
+    expect(rows?.[2]).not.toHaveProperty('leftDate');
+    expect(result.structuredContent).not.toHaveProperty('committees');
+    expect(textContent(result)).toContain(
+      '**committeeHistory\\[1\\].leftDate:** 2015-11-29T00:00:00.000',
+    );
+    expectMemberParity(result);
+  });
+
+  it('returns an interest over 24000 bytes whole on a limit 1 page with no size notice', async () => {
     const name = `<p>${'é'.repeat(15_000)}</p>`;
-    serveRows([interestRow({ InterestName: name })]);
+    serveRows([interestRow({ InterestName: name }), interestRow({ ID: memberGuid(3) })]);
     const result = await runToolContract(getMemberTool, {
       personNumber: '91',
       section: 'interests',
@@ -878,11 +1396,11 @@ describe('chparl_get_member', () => {
     expect(result.structuredContent).toMatchObject({
       interests: [{ interestName: name }],
       returnedCount: 1,
-      hasMore: false,
-      notice: expect.stringContaining(
-        'personNumber=91, section=interests, language=de, offset=0, limit=1',
-      ),
+      nextOffset: 1,
+      hasMore: true,
     });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(resultBytes(result)).toBeGreaterThan(24_000);
     expectMemberParity(result);
   });
 
@@ -929,13 +1447,15 @@ describe('chparl_get_member', () => {
           data: {
             reason: 'incompatible_fields',
             recovery: {
-              hint: 'Select council_terms, committees, or interests in chparl_get_member before supplying pagination.',
+              hint: 'Select council_terms, committees, committee_history, or interests in chparl_get_member before supplying pagination.',
             },
           },
         },
       });
       expect(textContent(result)).toContain('incompatible_fields');
-      expect(textContent(result)).toContain('council_terms, committees, or interests');
+      expect(textContent(result)).toContain(
+        'council_terms, committees, committee_history, or interests',
+      );
       expect(http.calls).toHaveLength(0);
     },
   );
@@ -955,6 +1475,11 @@ describe('member tool failure contracts', () => {
     { tool: searchMembersTool, input: { groupId: '9 or 1 eq 1' } },
     { tool: searchMembersTool, input: { committeeId: 'abc' } },
     { tool: searchMembersTool, input: { committeeId: '0' } },
+    { tool: searchMembersTool, input: { committeeId: '12', asOf: '2014-02-30' } },
+    { tool: searchMembersTool, input: { committeeId: '12', asOf: '03.03.2014' } },
+    { tool: searchMembersTool, input: { committeeId: '12', asOf: '2014-03-03T00:00:00Z' } },
+    { tool: searchMembersTool, input: { committeeId: '12', asOf: '2014-03-03T24:00:00.000' } },
+    { tool: searchMembersTool, input: { committeeId: '12', asOf: `2014-03-03${' '.repeat(40)}x` } },
     { tool: getMemberTool, input: {} },
     { tool: getMemberTool, input: { personNumber: '' } },
     { tool: getMemberTool, input: { personNumber: '0' } },
@@ -972,9 +1497,15 @@ describe('member tool failure contracts', () => {
     expect(http.calls).toHaveLength(0);
   });
 
-  it.each([{}, { committeeId: '12' }])(
-    'refuses an over-long query as request_too_long before any request (%o)',
-    async (scope) => {
+  it.each([
+    { query: 'é'.repeat(400) },
+    { committeeId: '12', query: 'é'.repeat(400) },
+    { committeeId: '12', asOf: '2014-03-03', query: 'é'.repeat(400) },
+    { interest: 'é'.repeat(255) },
+    { interest: 'Groupe Mutuel', query: 'é'.repeat(100) },
+  ])(
+    'refuses over-long text filters as request_too_long before any request (%o)',
+    async (input) => {
       http.reset();
       http.route({
         match: () => true,
@@ -986,24 +1517,21 @@ describe('member tool failure contracts', () => {
               })
             : Response.json({ d: [] }),
       });
-      const result = await runToolContract(searchMembersTool, {
-        ...scope,
-        query: 'é'.repeat(400),
-      });
+      const result = await runToolContract(searchMembersTool, input);
       expect(result.structuredContent).toMatchObject({
         error: {
           code: JsonRpcErrorCode.ValidationError,
           data: {
             reason: 'request_too_long',
             recovery: {
-              hint: 'Shorten query and retry this tool; the request carries query three times, once each for first, last, and official name.',
+              hint: 'Shorten query or interest and retry this tool; the request carries query three times, once each for first, last, and official name.',
             },
           },
         },
       });
       expect(textContent(result)).toContain('request_too_long');
       expect(textContent(result)).toContain(
-        'Shorten query and retry this tool; the request carries query three times, once each for first, last, and official name.',
+        'Shorten query or interest and retry this tool; the request carries query three times, once each for first, last, and official name.',
       );
       expect(http.calls).toHaveLength(0);
     },

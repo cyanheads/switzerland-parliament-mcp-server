@@ -12,6 +12,7 @@ import { resolveSubjectBusinesses } from '@/services/parliament/transcript-servi
 import { withWorkflow } from '@/services/parliament/workflow.js';
 import { parliamentHttp, textContent } from '../../helpers/parliament.js';
 import {
+  companyLawSubjectPage,
   marriageSubjectBusiness,
   requestedSubjects,
   subjectBusinessPage,
@@ -110,6 +111,9 @@ describe('transcript relationship service', () => {
     expect(urls[4]?.searchParams.get('$filter')).toBe(
       `Language eq 'DE' and ((${subjectPredicates}))`,
     );
+    expect(urls[4]?.searchParams.get('$orderby')).toBe(
+      'MeetingDate asc,MeetingVerbalixOid asc,IdSubject asc,SortOrder asc,ID asc',
+    );
     // A business-scoped page still resolves every subject: a subject can carry other businesses.
     expect(urls[5]?.searchParams.get('$filter')).toBe(
       `Language eq 'DE' and (${subjectPredicates})`,
@@ -126,15 +130,11 @@ describe('transcript relationship service', () => {
       const subjects = subjectsFixture(20, withCount);
       const result = await runToolContract(searchTranscriptsTool, { businessId: '20991234' });
       expect(result.isError).not.toBe(true);
-      // Byte fitting may deliver fewer than 20; the passage query still covers all 20 subjects.
-      const delivered = searchTranscriptsTool.output.parse(result.structuredContent).transcripts
-        .length;
-      expect(delivered).toBeGreaterThan(0);
       expect(result.structuredContent).toMatchObject({
         scopeFound: true,
-        returnedCount: delivered,
+        returnedCount: 20,
         totalCount: 20,
-        hasMore: delivered < 20,
+        hasMore: false,
       });
       const passageQuery = http?.calls
         .map((call) => new URL(call.request.url))
@@ -158,6 +158,45 @@ describe('transcript relationship service', () => {
       expectVoteParity(result);
     },
   );
+
+  it('fits 20 maximum-width subjects, every non-text filter, and the debate order in one passage query', async () => {
+    const subjects = Array.from({ length: 20 }, (_, i) => ({
+      IdSubject: String(9_223_372_036_854_775_807n - BigInt(i)),
+      BusinessNumber: 99_999_999,
+      Language: 'DE',
+    }));
+    http = parliamentHttp((request) => {
+      const url = new URL(request.url);
+      if (url.search.length - 1 > 2048) throw new Error('Query string exceeds the source limit.');
+      if (url.pathname.startsWith('/odata.svc/Business('))
+        return Response.json({ d: { ID: 99_999_999, Language: 'DE' } });
+      if (url.pathname === '/odata.svc/SubjectBusiness')
+        return Response.json({ d: { results: subjects, __count: '20' } });
+      return Response.json({ d: { results: [], __count: '0' } });
+    });
+    const result = await runToolContract(searchTranscriptsTool, {
+      businessId: '99999999',
+      personNumber: '2147483647',
+      sessionId: '2147483647',
+      council: 'S',
+      dateFrom: '1999-12-01',
+      dateTo: '2026-11-19',
+      limit: 100,
+      offset: Number.MAX_SAFE_INTEGER,
+    });
+    expect(result.isError).not.toBe(true);
+    const passageQuery = http.calls
+      .map((call) => new URL(call.request.url))
+      .find((url) => url.pathname === '/odata.svc/Transcript');
+    expect(passageQuery?.searchParams.get('$orderby')).toBe(
+      'MeetingDate asc,MeetingVerbalixOid asc,IdSubject asc,SortOrder asc,ID asc',
+    );
+    expect(passageQuery?.searchParams.get('$skip')).toBe(String(Number.MAX_SAFE_INTEGER));
+    expect(passageQuery?.searchParams.get('$filter')).toContain(
+      "MeetingCouncilAbbreviation eq 'S' and MeetingDate ge '19991201' and MeetingDate le '20261119'",
+    );
+    expect((passageQuery?.search.length ?? Infinity) - 1).toBeLessThanOrEqual(2048);
+  });
 
   it.each([true, false])(
     'refuses more than 20 subjects with count=$0 before any passage fetch',
@@ -262,6 +301,256 @@ describe('transcript relationship service', () => {
     });
     expect(http.calls).toHaveLength(2);
   });
+});
+
+/** Serve 16.077: the business, its subject reads, a passage per requested subject, no lookups. */
+function companyLawBusiness(withCount = true) {
+  http = parliamentHttp((request) => {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith('/odata.svc/Business('))
+      return Response.json({ d: { ID: 20160077, Language: 'DE' } });
+    if (url.pathname === '/odata.svc/SubjectBusiness')
+      return requestedSubjects(url).length > 0
+        ? subjectBusinessPage(url, [])
+        : companyLawSubjectPage(url, withCount);
+    if (url.pathname === '/odata.svc/Transcript') {
+      const results = requestedSubjects(url).map((IdSubject, i) => ({
+        ID: String(1000 + i),
+        Language: 'DE',
+        IdSubject,
+      }));
+      return Response.json({ d: { results, __count: String(results.length) } });
+    }
+    throw new Error(`Unexpected Parliament path ${url.pathname}`);
+  });
+}
+
+function callUrls(): URL[] {
+  return http?.calls.map((call) => new URL(call.request.url)) ?? [];
+}
+
+/** SubjectBusiness reads of a business's subjects, as distinct from the subjectBusinesses lookup. */
+function subjectReads(): URL[] {
+  return callUrls().filter(
+    (url) => url.pathname === '/odata.svc/SubjectBusiness' && requestedSubjects(url).length === 0,
+  );
+}
+
+const COMPANY_LAW_SUBJECTS = "Language eq 'DE' and (BusinessNumber eq 20160077)";
+
+describe('broad business narrowing', () => {
+  it.each([
+    {
+      input: { council: 'S', dateFrom: '2020-06-01', dateTo: '2020-06-19' },
+      predicates:
+        "Subjects/Meetings/Council eq 2 and Subjects/Meetings/Date ge datetime'2020-06-01T00:00:00' and Subjects/Meetings/Date le datetime'2020-06-19T23:59:59.999'",
+      subjects: ['48962', '49174', '49178', '49399', '49435'],
+    },
+    {
+      input: { sessionId: '5104' },
+      predicates: 'Subjects/Meetings/IdSession eq 5104',
+      subjects: ['48962', '48974', '49091', '49174', '49178', '49366', '49399', '49435', '49477'],
+    },
+    {
+      input: { council: 'N' },
+      predicates: 'Subjects/Meetings/Council eq 1',
+      subjects: [
+        '43617',
+        '43642',
+        '43644',
+        '46336',
+        '46349',
+        '46351',
+        '48173',
+        '48507',
+        '48719',
+        '48974',
+        '49091',
+        '49366',
+        '49477',
+      ],
+    },
+    {
+      input: { dateFrom: '2020-06-19', dateTo: '2020-06-19' },
+      predicates:
+        "Subjects/Meetings/Date ge datetime'2020-06-19T00:00:00' and Subjects/Meetings/Date le datetime'2020-06-19T23:59:59.999'",
+      subjects: ['49435', '49477'],
+    },
+    {
+      input: { council: 'Ständerat', dateTo: '2018-12-11', personNumber: '4102' },
+      predicates:
+        "Subjects/Meetings/Council eq 2 and Subjects/Meetings/Date le datetime'2018-12-11T23:59:59.999'",
+      subjects: ['44960'],
+    },
+  ])('narrows a 27-subject business with $input', async ({ input, predicates, subjects }) => {
+    companyLawBusiness();
+    const result = await runToolContract(searchTranscriptsTool, {
+      businessId: '20160077',
+      ...input,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(callUrls().map((url) => url.pathname)).toEqual([
+      "/odata.svc/Business(ID=20160077,Language='DE')",
+      '/odata.svc/SubjectBusiness',
+      '/odata.svc/SubjectBusiness',
+      '/odata.svc/Transcript',
+      '/odata.svc/SubjectBusiness',
+    ]);
+    const [all, narrowed] = subjectReads();
+    expect(all?.searchParams.get('$filter')).toBe(COMPANY_LAW_SUBJECTS);
+    expect(narrowed?.searchParams.get('$filter')).toBe(
+      `Language eq 'DE' and (BusinessNumber eq 20160077 and ${predicates})`,
+    );
+    expect(narrowed?.searchParams.get('$top')).toBe('20');
+    const passageQuery = callUrls().find((url) => url.pathname === '/odata.svc/Transcript');
+    expect(passageQuery && requestedSubjects(passageQuery)).toEqual(subjects);
+    expect(
+      searchTranscriptsTool.output
+        .parse(result.structuredContent)
+        .transcripts.map((passage) => passage.subjectId),
+    ).toEqual(subjects);
+    expect(result.structuredContent).toMatchObject({
+      scopeFound: true,
+      returnedCount: subjects.length,
+      totalCount: subjects.length,
+      hasMore: false,
+    });
+    for (const url of callUrls()) expect(url.search.length - 1).toBeLessThanOrEqual(2048);
+    expectVoteParity(result);
+  });
+
+  it('narrows without source counts, probing each full subject page once', async () => {
+    companyLawBusiness(false);
+    const result = await runToolContract(searchTranscriptsTool, {
+      businessId: '20160077',
+      council: 'S',
+      dateFrom: '2020-06-01',
+      dateTo: '2020-06-19',
+    });
+    expect(result.isError).not.toBe(true);
+    expect(
+      subjectReads().map((url) => [
+        url.searchParams.get('$filter') === COMPANY_LAW_SUBJECTS,
+        url.searchParams.get('$skip'),
+        url.searchParams.get('$top'),
+      ]),
+    ).toEqual([
+      [true, '0', '20'],
+      [true, '20', '1'],
+      [false, '0', '20'],
+    ]);
+    expect(result.structuredContent).toMatchObject({ returnedCount: 5, totalCount: 5 });
+  });
+
+  it.each([true, false])(
+    'refuses a business that keeps more than 20 subjects after narrowing (count=$0)',
+    async (withCount) => {
+      companyLawBusiness(withCount);
+      const result = await runToolContract(searchTranscriptsTool, {
+        businessId: '20160077',
+        dateFrom: '2018-01-01',
+      });
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringContaining('council, session, and date filters'),
+          data: {
+            reason: 'business_scope_too_broad',
+            recovery: { hint: expect.stringContaining('council, sessionId, or a narrower date') },
+          },
+        },
+      });
+      expect(textContent(result)).toContain('section subjects');
+      const narrowed = `Language eq 'DE' and (BusinessNumber eq 20160077 and Subjects/Meetings/Date ge datetime'2018-01-01T00:00:00')`;
+      expect(
+        subjectReads().map((url) => [
+          url.searchParams.get('$filter'),
+          url.searchParams.get('$skip'),
+        ]),
+      ).toEqual(
+        withCount
+          ? [
+              [COMPANY_LAW_SUBJECTS, '0'],
+              [narrowed, '0'],
+            ]
+          : [
+              [COMPANY_LAW_SUBJECTS, '0'],
+              [COMPANY_LAW_SUBJECTS, '20'],
+              [narrowed, '0'],
+              [narrowed, '20'],
+            ],
+      );
+      expect(callUrls().some((url) => url.pathname === '/odata.svc/Transcript')).toBe(false);
+    },
+  );
+
+  it('refuses a broad business searched by speaker alone without a narrowed read', async () => {
+    companyLawBusiness();
+    const result = await runToolContract(searchTranscriptsTool, {
+      businessId: '20160077',
+      personNumber: '4102',
+    });
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        message: 'This business has more than 20 associated debate subjects.',
+        data: { reason: 'business_scope_too_broad' },
+      },
+    });
+    expect(subjectReads().map((url) => url.searchParams.get('$filter'))).toEqual([
+      COMPANY_LAW_SUBJECTS,
+    ]);
+    expect(callUrls()).toHaveLength(2);
+  });
+
+  it('answers a business narrowed to no subject as a no-match, without a passage query', async () => {
+    companyLawBusiness();
+    const result = await runToolContract(searchTranscriptsTool, {
+      businessId: '20160077',
+      council: 'S',
+      dateFrom: '2018-06-14',
+      dateTo: '2018-06-15',
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      scopeFound: true,
+      transcripts: [],
+      returnedCount: 0,
+      totalCount: 0,
+      hasMore: false,
+    });
+    expect(textContent(result)).toContain('No Bulletin passages matched');
+    expect(textContent(result)).not.toContain('no published debate subjects');
+    expect(callUrls().map((url) => url.pathname)).toEqual([
+      "/odata.svc/Business(ID=20160077,Language='DE')",
+      '/odata.svc/SubjectBusiness',
+      '/odata.svc/SubjectBusiness',
+    ]);
+    expectVoteParity(result);
+  });
+
+  it.each([true, false])(
+    'keeps a business of 20 subjects on its unnarrowed path despite meeting filters (count=$0)',
+    async (withCount) => {
+      const subjects = subjectsFixture(20, withCount);
+      const result = await runToolContract(searchTranscriptsTool, {
+        businessId: '20991234',
+        council: 'S',
+        sessionId: '5104',
+        dateFrom: '2020-06-01',
+        dateTo: '2020-06-19',
+      });
+      expect(result.isError).not.toBe(true);
+      expect(subjectReads()).toHaveLength(withCount ? 1 : 2);
+      expect(
+        callUrls().some((url) => url.searchParams.get('$filter')?.includes('Subjects/Meetings')),
+      ).toBe(false);
+      const passageQuery = callUrls().find((url) => url.pathname === '/odata.svc/Transcript');
+      expect(passageQuery?.searchParams.get('$filter')).toBe(
+        `Language eq 'DE' and ((${subjects.map((row) => `IdSubject eq ${row.IdSubject}L`).join(' or ')}) and IdSession eq '5104' and MeetingCouncilAbbreviation eq 'S' and MeetingDate ge '20200601' and MeetingDate le '20200619')`,
+      );
+      expect(result.structuredContent).toMatchObject({ returnedCount: 20, totalCount: 20 });
+    },
+  );
 });
 
 /** Resolve inside a real workflow; `before` runs inside it, ahead of the lookup. */

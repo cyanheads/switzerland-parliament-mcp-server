@@ -72,7 +72,8 @@ export type ParliamentEntity =
   | 'Party'
   | 'ParlGroup'
   | 'Committee'
-  | 'Session';
+  | 'Session'
+  | 'Tags';
 
 /** Exact composite-key entity URL citing one source record; `key` is a validated OData literal. */
 export function odataEntityUrl(entity: ParliamentEntity, key: string, language: Language): string {

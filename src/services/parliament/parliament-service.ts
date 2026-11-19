@@ -5,7 +5,7 @@
 
 import { z } from '@cyanheads/mcp-ts-core';
 import { serializationError } from '@cyanheads/mcp-ts-core/errors';
-import { odataDay, RawDate, RawId, RawLanguage, RawText } from './normalization.js';
+import { odataDay, odataString, RawDate, RawId, RawLanguage, RawText } from './normalization.js';
 import { ODataClient, type ODataPage, type ODataQuery } from './odata-client.js';
 import type { ReferenceFilters, ReferenceItem } from './reference-model.js';
 import { staticReference } from './static-reference.js';
@@ -16,6 +16,7 @@ const RawReferenceSchema = z.object({
   Language: RawLanguage,
   BusinessTypeName: RawText,
   BusinessTypeAbbreviation: RawText,
+  TagName: RawText,
   CouncilName: RawText,
   CouncilAbbreviation: RawText,
   CantonNumber: RawId.optional(),
@@ -52,13 +53,15 @@ type ReferenceDefinition = {
   key: 'ID' | 'CantonNumber' | 'PartyNumber' | 'ParlGroupNumber' | 'CommitteeNumber';
   label:
     | 'BusinessTypeName'
+    | 'TagName'
     | 'CouncilName'
     | 'CantonName'
     | 'PartyName'
     | 'ParlGroupName'
     | 'CommitteeName'
     | 'SessionName';
-  abbreviation:
+  /** Absent for a dictionary that publishes no abbreviation. */
+  abbreviation?:
     | 'BusinessTypeAbbreviation'
     | 'CouncilAbbreviation'
     | 'CantonAbbreviation'
@@ -78,6 +81,14 @@ const definitions: Record<LiveTopic, ReferenceDefinition> = {
     label: 'BusinessTypeName',
     abbreviation: 'BusinessTypeAbbreviation',
     fields: ['BusinessTypeName', 'BusinessTypeAbbreviation'],
+    schema: RawReferenceSchema,
+    orderBy: [{ field: 'ID', direction: 'asc' }],
+  },
+  tags: {
+    entity: 'Tags',
+    key: 'ID',
+    label: 'TagName',
+    fields: ['TagName'],
     schema: RawReferenceSchema,
     orderBy: [{ field: 'ID', direction: 'asc' }],
   },
@@ -175,7 +186,7 @@ function normalizeReference(
   if (key === undefined)
     throw serializationError('Parliament reference row is missing its dictionary key.');
   const label = raw[definition.label];
-  const abbreviation = raw[definition.abbreviation];
+  const abbreviation = definition.abbreviation && raw[definition.abbreviation];
   const sessionParts = [
     raw.SessionNumber === undefined ? undefined : `SessionNumber: ${raw.SessionNumber}`,
     raw.TypeName == null ? undefined : `TypeName: ${raw.TypeName}`,
@@ -234,6 +245,15 @@ export class ParliamentService {
     const predicates: string[] = [];
     if (filters.dateFrom) predicates.push(`StartDate ge ${odataDay(filters.dateFrom)}`);
     if (filters.dateTo) predicates.push(`EndDate le ${odataDay(filters.dateTo, 'end')}`);
+    if (filters.query !== undefined) {
+      // Match only what each entry renders; the source's substringof ignores case and accents.
+      const text = odataString(filters.query);
+      const fields = [
+        definition.label,
+        ...(definition.abbreviation ? [definition.abbreviation] : []),
+      ];
+      predicates.push(`(${fields.map((field) => `substringof(${text},${field})`).join(' or ')})`);
+    }
     const query: ODataQuery = {
       entity: definition.entity,
       language: filters.language,

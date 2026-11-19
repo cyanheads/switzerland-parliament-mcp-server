@@ -42,6 +42,85 @@ const conjunction = {
 };
 const clauses =
   "substringof('O''Brien é',Title) and substringof('A & B',SubmittedBy) and BusinessType eq 3 and BusinessStatus eq 9999 and SubmissionSession eq 50 and SubmissionDate ge datetime'2026-01-01T00:00:00' and SubmissionDate le datetime'2026-02-28T23:59:59.999'";
+const roleClauses =
+  "substringof('O''Brien é',Businesses/Title) and substringof('A & B',Businesses/SubmittedBy) and Businesses/BusinessType eq 3 and Businesses/BusinessStatus eq 9999 and Businesses/SubmissionSession eq 50 and Businesses/SubmissionDate ge datetime'2026-01-01T00:00:00' and Businesses/SubmissionDate le datetime'2026-02-28T23:59:59.999'";
+
+/** BusinessRole identity row; the GUID suffix only needs to be unique per fixture. */
+function roleRow(index: number, BusinessNumber: number) {
+  return {
+    ID: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    Language: 'DE',
+    BusinessNumber,
+  };
+}
+
+/**
+ * Serve role pages from `roles` by BusinessNumber keyset, a count only when one is requested,
+ * and hydrate every requested business ID from the synthetic row.
+ */
+function serveRoles(roles: ReturnType<typeof roleRow>[]) {
+  http.reset();
+  http.route({
+    match: () => true,
+    respond: (request) => {
+      const url = new URL(request.url);
+      const filter = url.searchParams.get('$filter') ?? '';
+      if (url.pathname === '/odata.svc/Business') {
+        const ids = [...filter.matchAll(/ID eq (\d+)/g)].map((match) => Number(match[1]));
+        return Response.json({
+          d: { results: ids.map((ID) => ({ ...businessRow, ID })), __count: String(ids.length) },
+        });
+      }
+      const after = /BusinessNumber lt (\d+)/.exec(filter)?.[1];
+      const selected = roles.filter(
+        (row) => after === undefined || row.BusinessNumber < Number(after),
+      );
+      const results = selected.slice(0, Number(url.searchParams.get('$top')));
+      return Response.json({
+        d: url.searchParams.has('$inlinecount')
+          ? { results, __count: String(selected.length) }
+          : results,
+      });
+    },
+  });
+}
+
+/**
+ * Apply the Tags clauses of an emitted $filter to one Tags value with OData semantics: each
+ * eq/startswith/endswith/substringof clause is read from the filter itself, then ORed.
+ */
+function tagFilterMatches(filter: string, tags: string | undefined): boolean {
+  const field = String.raw`(?:Businesses\/)?Tags`;
+  const tests: ((value: string) => boolean)[] = [];
+  for (const [, literal = ''] of filter.matchAll(new RegExp(`${field} eq '([^']*)'`, 'g')))
+    tests.push((value) => value === literal);
+  for (const [, literal = ''] of filter.matchAll(
+    new RegExp(`startswith\\(${field},'([^']*)'\\)`, 'g'),
+  ))
+    tests.push((value) => value.startsWith(literal));
+  for (const [, literal = ''] of filter.matchAll(
+    new RegExp(`endswith\\(${field},'([^']*)'\\)`, 'g'),
+  ))
+    tests.push((value) => value.endsWith(literal));
+  for (const [, literal = ''] of filter.matchAll(
+    new RegExp(`substringof\\('([^']*)',${field}\\)`, 'g'),
+  ))
+    tests.push((value) => value.includes(literal));
+  return tags !== undefined && tests.some((test) => test(tags));
+}
+
+/** Path, filter, count option, and page size of every Parliament request, in order. */
+function requestShapes() {
+  return http.calls.map(({ request }) => {
+    const url = new URL(request.url);
+    return [
+      url.pathname.replace('/odata.svc/', ''),
+      url.searchParams.get('$filter'),
+      url.searchParams.get('$inlinecount'),
+      url.searchParams.get('$top'),
+    ];
+  });
+}
 
 describe('chparl_search_business', () => {
   it.each([0, 1, 2, 3])('uses one count-free lookahead for %i author matches', async (size) => {
@@ -175,7 +254,7 @@ describe('chparl_search_business', () => {
     expectBusinessParity(result);
   });
 
-  it('continues author byte-fitted pages from delivered rows and reaches the held-back row', async () => {
+  it('returns full author pages of large records and continues to the lookahead row', async () => {
     const rows = Array.from({ length: 102 }, (_, index) => ({
       ID: 20991234 - index,
       Language: 'DE',
@@ -192,16 +271,16 @@ describe('chparl_search_business', () => {
       },
     });
     const collected: string[] = [];
+    const pageSizes: number[] = [];
     let cursor: string | undefined;
-    for (let page = 0; page < 10; page++) {
+    for (let page = 0; page < 3; page++) {
       const result = await runToolContract(searchBusinessTool, {
         author: 'Maillard',
         limit: 101,
         ...(cursor && { cursor }),
       });
       const items = searchBusinessTool.output.parse(result.structuredContent).businesses;
-      expect(items.length).toBeGreaterThan(0);
-      if (page === 0) expect(items.length).toBeLessThan(100);
+      pageSizes.push(items.length);
       expect(items.map((item) => item.businessId)).toEqual(
         rows
           .slice(collected.length, collected.length + items.length)
@@ -209,7 +288,12 @@ describe('chparl_search_business', () => {
       );
       collected.push(...items.map((item) => item.businessId));
       expect(result.structuredContent).not.toHaveProperty('totalCount');
-      expect(result.structuredContent).toMatchObject({ hasMore: collected.length < 102 });
+      expect(result.structuredContent).toMatchObject({
+        returnedCount: items.length,
+        effectiveLimit: 100,
+        hasMore: collected.length < 102,
+        notice: 'Requested limit 101 was clamped to 100.',
+      });
       expectBusinessParity(result);
       if (collected.length === 102) break;
       cursor = businessNextCursor(result);
@@ -217,11 +301,15 @@ describe('chparl_search_business', () => {
         lastBusinessId: collected.at(-1),
       });
     }
+    expect(pageSizes).toEqual([100, 2]);
     expect(collected).toEqual(rows.map((item) => String(item.ID)));
     expect(
       http.calls.every(({ request }) => !new URL(request.url).searchParams.has('$inlinecount')),
     ).toBe(true);
-    expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$top')).toBe('101');
+    expect(http.calls.map(({ request }) => new URL(request.url).searchParams.get('$top'))).toEqual([
+      '101',
+      '101',
+    ]);
   });
 
   it('keeps counted non-author first pages and original-filter continuation recounts', async () => {
@@ -458,14 +546,20 @@ describe('chparl_search_business', () => {
               __count: '2',
             },
           });
+        const counted = url.searchParams.has('$inlinecount');
         if (url.searchParams.get('$filter')?.includes('BusinessNumber lt')) {
-          return Response.json({
-            d: { results: [role('00000000-0000-4000-8000-000000000005', 20991232)], __count: '9' },
-          });
+          const results = [role('00000000-0000-4000-8000-000000000005', 20991232)];
+          return Response.json({ d: counted ? { results, __count: '9' } : results });
         }
         const skip = Number(url.searchParams.get('$skip'));
+        const next = new URL(url);
+        next.searchParams.set('$skip', '2');
         return Response.json({
-          d: { results: skip === 0 ? roles.slice(0, 2) : roles.slice(2), __count: '20' },
+          d: {
+            results: skip === 0 ? roles.slice(0, 2) : roles.slice(2),
+            ...(skip === 0 && { __next: next.href }),
+            ...(counted && { __count: '20' }),
+          },
         });
       },
     });
@@ -498,6 +592,12 @@ describe('chparl_search_business', () => {
       filter?.replace(/\)$/, ' and BusinessNumber lt 20991233)'),
     );
     expect(urls[3]?.searchParams.get('$top')).toBe('1');
+    // Committee totals are never reported, so neither role query asks the source to count.
+    expect(
+      urls
+        .filter((url) => url.pathname === '/odata.svc/BusinessRole')
+        .map((url) => url.searchParams.has('$inlinecount')),
+    ).toEqual([false, false, false]);
     const cursor = businessNextCursor(result);
     expect(typeof cursor).toBe('string');
     if (typeof cursor !== 'string') throw new Error('Expected nextCursor.');
@@ -529,7 +629,7 @@ describe('chparl_search_business', () => {
     expectBusinessParity(end);
   });
 
-  it('fits whole businesses and bases the next cursor on the last delivered item', async () => {
+  it('returns every whole business of a full page and keys the cursor to the last one', async () => {
     const rows = Array.from({ length: 100 }, (_, index) => ({
       ID: 20991234 - index,
       Language: 'DE',
@@ -542,33 +642,27 @@ describe('chparl_search_business', () => {
       author: ' ',
     });
     const output = searchBusinessTool.output.parse(result.structuredContent);
-    expect(output.businesses.length).toBeGreaterThan(0);
-    expect(output.businesses.length).toBeLessThan(100);
-    expect(output.businesses.map((item) => item.title)).toEqual(
-      rows.slice(0, output.businesses.length).map((row) => row.Title),
-    );
+    expect(output.businesses.map((item) => item.title)).toEqual(rows.map((row) => row.Title));
     expect(result.structuredContent).toMatchObject({
-      returnedCount: output.businesses.length,
+      returnedCount: 100,
       effectiveLimit: 100,
       totalCount: 101,
       hasMore: true,
+      notice: 'Requested limit 10000 was clamped to 100.',
     });
-    const cursor = businessNextCursor(result);
-    if (typeof cursor !== 'string') throw new Error('Expected cursor.');
-    expect(JSON.parse(Buffer.from(cursor, 'base64url').toString())).toMatchObject({
-      lastBusinessId: String(20991235 - output.businesses.length),
-    });
+    expect(
+      JSON.parse(Buffer.from(businessNextCursor(result), 'base64url').toString()),
+    ).toMatchObject({ lastBusinessId: '20991135' });
+    // A page over 24,000 bytes is delivered whole.
     expect(
       new TextEncoder().encode(
         JSON.stringify({ structuredContent: result.structuredContent, content: result.content }),
       ).byteLength,
-    ).toBeLessThan(24_000);
-    expect(textContent(result)).toContain('clamped to 100');
-    expect(textContent(result)).toContain('no business fields were shortened');
+    ).toBeGreaterThan(24_000);
     expectBusinessParity(result);
   });
 
-  it('batches 100 committee candidates and drains fitted continuations across a duplicate boundary', async () => {
+  it('batches 100 committee candidates and drains continuations across a duplicate boundary', async () => {
     const ids = Array.from({ length: 101 }, (_, index) => 20991234 - index);
     const candidates = [...ids.slice(0, 99), 20991136, ...ids.slice(99)].map((id, index) => ({
       ID: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
@@ -586,7 +680,7 @@ describe('chparl_search_business', () => {
         const top = Number(url.searchParams.get('$top'));
         if (url.pathname === '/odata.svc/Business') {
           const selected = [...filter.matchAll(/ID eq (\d+)/g)].map((match) => Number(match[1]));
-          batchSizes.push(selected.length);
+          if (skip === 0) batchSizes.push(selected.length);
           expect(url.href.length).toBeLessThan(2048);
           return Response.json({
             d: {
@@ -612,8 +706,9 @@ describe('chparl_search_business', () => {
       },
     });
     const collected: string[] = [];
+    const pageSizes: number[] = [];
     let cursor: string | undefined;
-    for (;;) {
+    for (let page = 0; page < 3; page++) {
       const result = await runToolContract(searchBusinessTool, {
         committeeId: '7',
         limit: cursor ? 100 : 101,
@@ -621,6 +716,7 @@ describe('chparl_search_business', () => {
       });
       expect(result.isError).not.toBe(true);
       const items = searchBusinessTool.output.parse(result.structuredContent).businesses;
+      pageSizes.push(items.length);
       expect(items.map((item) => item.businessId)).toEqual(
         ids.slice(collected.length, collected.length + items.length).map(String),
       );
@@ -630,26 +726,21 @@ describe('chparl_search_business', () => {
         effectiveLimit: 100,
         hasMore: collected.length + items.length < 101,
       });
-      expect(
-        new TextEncoder().encode(
-          JSON.stringify({ structuredContent: result.structuredContent, content: result.content }),
-        ).byteLength,
-      ).toBeLessThan(24_000);
       expectBusinessParity(result);
       collected.push(...items.map((item) => item.businessId));
       if (collected.length === 101) break;
-      expect(items.length).toBeGreaterThan(0);
       cursor = businessNextCursor(result);
       expect(JSON.parse(Buffer.from(cursor, 'base64url').toString())).toMatchObject({
         lastBusinessId: String(ids[collected.length - 1]),
       });
     }
+    // 100 role rows carry 99 distinct businesses; the duplicate shortens only the first page.
+    expect(pageSizes).toEqual([99, 2]);
     expect(collected).toEqual(ids.map(String));
-    expect(batchSizes).toContain(50);
-    expect(batchSizes.every((size) => size <= 50)).toBe(true);
+    expect(batchSizes).toEqual([50, 49, 2]);
   });
 
-  it('returns a maximum small page and a whole indivisible oversized item', async () => {
+  it('returns a maximum page of limit records and one large record whole without a size notice', async () => {
     serve({
       d: {
         results: Array.from({ length: 100 }, (_, index) => ({
@@ -660,8 +751,13 @@ describe('chparl_search_business', () => {
       },
     });
     const max = await runToolContract(searchBusinessTool, { limit: 100 });
-    // Complete-result fitting may reduce even sparse records; every delivered record is complete.
-    expect(max.structuredContent).toMatchObject({ effectiveLimit: 100, totalCount: 100 });
+    expect(max.structuredContent).toMatchObject({
+      effectiveLimit: 100,
+      returnedCount: 100,
+      totalCount: 100,
+      hasMore: false,
+    });
+    expect(max.structuredContent).not.toHaveProperty('notice');
     const title = '界'.repeat(15_000);
     serve({ d: { results: [{ ID: 20991234, Language: 'DE', Title: title }], __count: '1' } });
     const result = await runToolContract(searchBusinessTool, { limit: 1 });
@@ -670,8 +766,8 @@ describe('chparl_search_business', () => {
       returnedCount: 1,
       hasMore: false,
     });
-    expect(textContent(result)).toContain('limit');
-    expect(textContent(result)).toContain('One indivisible business');
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(textContent(result)).not.toContain('notice');
     expectBusinessParity(result);
   });
 
@@ -741,6 +837,13 @@ describe('chparl_search_business', () => {
     { language: 'en' },
     { submittedFrom: '2026-02-30' },
     { committeeId: '2147483648' },
+    { personNumber: '0' },
+    { personNumber: '2147483648' },
+    { personNumber: '4102', role: 'signer' },
+    { personNumber: '4102', role: 7 },
+    { committeeId: '10', tagId: '0' },
+    { committeeId: '10', tagId: '12|28' },
+    { committeeId: '10', tagId: "12' or 1 eq 1" },
   ])('rejects invalid input %o', async (input) => {
     const result = await runToolContract(searchBusinessTool, input);
     expect(result.structuredContent).toMatchObject({
@@ -1061,7 +1164,7 @@ describe('chparl_search_business', () => {
     expect(http.calls).toHaveLength(0);
   });
 
-  it('advances a byte-fitted committee page from delivered businesses rather than examined roles', async () => {
+  it('delivers a full committee page of large records and continues after the last business', async () => {
     const roles = Array.from({ length: 20 }, (_, index) => ({
       ID: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
       Language: 'DE',
@@ -1072,36 +1175,32 @@ describe('chparl_search_business', () => {
         Title: `<p>${'界'.repeat(300)} ${index}</p>`,
       },
     }));
+    const older = {
+      ID: '00000000-0000-4000-8000-000000000021',
+      Language: 'DE',
+      BusinessNumber: 20991214,
+    };
     http.reset();
     http.route({
       match: () => true,
       respond: (request) =>
         Response.json({
-          d: {
-            results:
-              new URL(request.url).pathname === '/odata.svc/Business'
-                ? roles.map((row) => row.Businesses)
-                : new URL(request.url).searchParams.get('$filter')?.includes('BusinessNumber lt')
-                  ? []
-                  : roles,
-            __count: new URL(request.url).searchParams.get('$filter')?.includes('BusinessNumber lt')
-              ? '0'
-              : '20',
-          },
+          d:
+            new URL(request.url).pathname === '/odata.svc/Business'
+              ? { results: roles.map((row) => row.Businesses), __count: '20' }
+              : new URL(request.url).searchParams.get('$filter')?.includes('BusinessNumber lt')
+                ? [older]
+                : roles,
         }),
     });
     const result = await runToolContract(searchBusinessTool, { committeeId: '7' });
     const items = searchBusinessTool.output.parse(result.structuredContent).businesses;
-    expect(items.length).toBeGreaterThan(0);
-    expect(items.length).toBeLessThan(20);
-    expect(items.map((item) => item.title)).toEqual(
-      roles.slice(0, items.length).map((row) => row.Businesses.Title),
-    );
+    expect(items.map((item) => item.title)).toEqual(roles.map((row) => row.Businesses.Title));
     expect(result.structuredContent).not.toHaveProperty('totalCount');
-    expect(result.structuredContent).toMatchObject({ returnedCount: items.length, hasMore: true });
+    expect(result.structuredContent).toMatchObject({ returnedCount: 20, hasMore: true });
     expect(
       JSON.parse(Buffer.from(businessNextCursor(result), 'base64url').toString()),
-    ).toMatchObject({ lastBusinessId: String(20991235 - items.length) });
+    ).toMatchObject({ lastBusinessId: '20991215', route: 'committee' });
     expectBusinessParity(result);
   });
 
@@ -1126,5 +1225,500 @@ describe('chparl_search_business', () => {
       expect(textContent(result)).toContain('without cursor');
     }
     expect(http.calls).toHaveLength(1);
+  });
+
+  it('continues cursors issued by 0.2.0 for direct and committee searches', async () => {
+    // Literal 0.2.0 cursors: filters added later must drop out of the fingerprint when absent.
+    const direct =
+      'eyJ2ZXJzaW9uIjoxLCJmaW5nZXJwcmludCI6IjE0NjUwMzM0YThiOTZlZjgxZjQ3YTM5ZGZiMGM2MDlmNDdiZGJjOGQzM2YyMTkwMjA4YmYxYjQ1NGFmMThkMWEiLCJsYW5ndWFnZSI6ImRlIiwib3JkZXIiOiJidXNpbmVzc19pZF9kZXNjIiwicm91dGUiOiJidXNpbmVzcyIsImxhc3RCdXNpbmVzc0lkIjoiMjA5OTEyMzQifQ';
+    const committee =
+      'eyJ2ZXJzaW9uIjoxLCJmaW5nZXJwcmludCI6ImVkMjJmZTdlMmQ0NTQ4OTYyZTcxMjU3ZWM4NzBiMWUzOGJkZWMzOGU0OGUyYWM5ZDA5OTU1MWE5ZDFiMGNkNDMiLCJsYW5ndWFnZSI6ImRlIiwib3JkZXIiOiJidXNpbmVzc19pZF9kZXNjIiwicm91dGUiOiJjb21taXR0ZWUiLCJsYXN0QnVzaW5lc3NJZCI6IjIwOTkxMjMzIn0';
+    serve({ d: { results: [{ ID: 20991233, Language: 'DE' }], __count: '2' } });
+    const continued = await runToolContract(searchBusinessTool, {
+      query: 'original',
+      limit: 1,
+      cursor: direct,
+    });
+    expect(continued.isError).not.toBe(true);
+    expect(continued.structuredContent).toMatchObject({
+      businesses: [{ businessId: '20991233' }],
+      totalCount: 2,
+    });
+    expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$filter')).toBe(
+      "Language eq 'DE' and (substringof('original',Title) and ID lt 20991234)",
+    );
+    serve({ d: [] });
+    const roles = await runToolContract(searchBusinessTool, {
+      committeeId: '7',
+      cursor: committee,
+    });
+    expect(roles.isError).not.toBe(true);
+    expect(roles.structuredContent).toMatchObject({ businesses: [], hasMore: false });
+    expect(new URL(http.calls[0]?.request.url ?? '').searchParams.get('$filter')).toBe(
+      "Language eq 'DE' and (CommitteeNumber eq 7 and Businesses/Language eq 'DE' and BusinessNumber lt 20991233)",
+    );
+  });
+
+  it('reads one member role with its inline total and recounts the original filters on continuation', async () => {
+    serveRoles([20991234, 20991233, 20991232].map((id, index) => roleRow(index + 1, id)));
+    const input = { ...conjunction, personNumber: '4102', role: 'author', limit: 2 };
+    const first = await runToolContract(searchBusinessTool, input);
+    expect(first.isError).not.toBe(true);
+    expect(first.structuredContent).toMatchObject({
+      businesses: [
+        { ...businessSummary, businessId: '20991234' },
+        {
+          businessId: '20991233',
+          sourceUrl:
+            "https://ws.parlament.ch/odata.svc/Business(ID=20991233,Language='DE')?$format=json",
+        },
+      ],
+      effectiveFilters: { personNumber: '4102', role: 'author', limit: 2 },
+      returnedCount: 2,
+      totalCount: 3,
+      hasMore: true,
+    });
+    expect(first.structuredContent).not.toHaveProperty('notice');
+    const cursor = businessNextCursor(first);
+    expect(JSON.parse(Buffer.from(cursor, 'base64url').toString())).toMatchObject({
+      route: 'member',
+      lastBusinessId: '20991233',
+    });
+    const second = await runToolContract(searchBusinessTool, { ...input, cursor });
+    expect(second.structuredContent).toMatchObject({
+      businesses: [{ businessId: '20991232' }],
+      returnedCount: 1,
+      totalCount: 3,
+      hasMore: false,
+    });
+    expect(second.structuredContent).not.toHaveProperty('nextCursor');
+    const owner = `MemberCouncilNumber eq 4102 and Role eq 7 and Businesses/Language eq 'DE' and ${roleClauses}`;
+    const page = `Language eq 'DE' and (${owner})`;
+    expect(requestShapes()).toEqual([
+      ['BusinessRole', page, 'allpages', '2'],
+      ['Business', expect.stringContaining('ID eq 20991234 or ID eq 20991233'), 'allpages', '2'],
+      ['BusinessRole', `Language eq 'DE' and (${owner} and BusinessNumber lt 20991233)`, null, '1'],
+      ['BusinessRole', `Language eq 'DE' and (${owner} and BusinessNumber lt 20991233)`, null, '2'],
+      ['BusinessRole', page, 'allpages', '1'],
+      ['Business', expect.stringContaining('ID eq 20991232'), 'allpages', '1'],
+      ['BusinessRole', `Language eq 'DE' and (${owner} and BusinessNumber lt 20991232)`, null, '1'],
+    ]);
+    for (const { request } of http.calls.filter(({ request }) =>
+      request.url.includes('/BusinessRole?'),
+    )) {
+      const url = new URL(request.url);
+      expect(url.searchParams.get('$select')).toBe('ID,Language,BusinessNumber');
+      expect(url.searchParams.get('$orderby')).toBe('BusinessNumber desc,ID asc');
+    }
+    expectBusinessParity(first);
+    expectBusinessParity(second);
+  });
+
+  it('pages every role of a member once per business without a total and discloses short pages', async () => {
+    serveRoles([
+      roleRow(1, 20991234),
+      roleRow(2, 20991234),
+      roleRow(3, 20991233),
+      roleRow(4, 20991232),
+    ]);
+    const result = await runToolContract(searchBusinessTool, { personNumber: '4102', limit: 3 });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      businesses: [{ businessId: '20991234' }, { businessId: '20991233' }],
+      returnedCount: 2,
+      effectiveLimit: 3,
+      hasMore: true,
+      notice:
+        "Pages without role examine at most the effective limit of this member's role rows and return each business once. Pages can be short; a distinct business total is unavailable. A single role reports an exact total.",
+    });
+    expect(result.structuredContent).not.toHaveProperty('totalCount');
+    const owner = "MemberCouncilNumber eq 4102 and Businesses/Language eq 'DE'";
+    expect(requestShapes()).toEqual([
+      ['BusinessRole', `Language eq 'DE' and (${owner})`, null, '3'],
+      ['Business', expect.stringContaining('ID eq 20991234 or ID eq 20991233'), 'allpages', '2'],
+      ['BusinessRole', `Language eq 'DE' and (${owner} and BusinessNumber lt 20991233)`, null, '1'],
+    ]);
+    expect(textContent(result)).toContain('A single role reports an exact total.');
+    expectBusinessParity(result);
+  });
+
+  it.each([
+    ['author', 7],
+    ['cosignatory', 3],
+    ['spokesperson', 2],
+    ['opponent', 1],
+    ['successor', 4],
+  ])(
+    'maps role %s to BusinessRole.Role %i and reports an empty exact total',
+    async (role, code) => {
+      serveRoles([]);
+      const result = await runToolContract(searchBusinessTool, { personNumber: '1156', role });
+      expect(result.structuredContent).toMatchObject({
+        businesses: [],
+        totalCount: 0,
+        returnedCount: 0,
+        hasMore: false,
+        notice: expect.stringContaining('No parliamentary business matched'),
+      });
+      expect(requestShapes()).toEqual([
+        [
+          'BusinessRole',
+          `Language eq 'DE' and (MemberCouncilNumber eq 1156 and Role eq ${code} and Businesses/Language eq 'DE')`,
+          'allpages',
+          '20',
+        ],
+      ]);
+      expectBusinessParity(result);
+    },
+  );
+
+  it.each([
+    {
+      input: { personNumber: '4102', committeeId: '7' },
+      message: 'personNumber cannot be combined with committeeId.',
+      hint: 'Search by committeeId or by personNumber, not both, then retry chparl_search_business.',
+    },
+    {
+      input: { role: 'author' },
+      message: 'role requires personNumber.',
+      hint: 'Add personNumber from chparl_search_members, or omit role, then retry chparl_search_business.',
+    },
+    {
+      input: { role: 'cosignatory', committeeId: '7' },
+      message: 'role requires personNumber.',
+      hint: 'Add personNumber from chparl_search_members, or omit role, then retry chparl_search_business.',
+    },
+  ])('rejects $input as incompatible_fields before I/O', async ({ input, message, hint }) => {
+    const result = await runToolContract(searchBusinessTool, input);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        message,
+        data: { reason: 'incompatible_fields', recovery: { hint } },
+      },
+    });
+    expect(textContent(result)).toContain('incompatible_fields');
+    expect(textContent(result)).toContain(hint);
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it('rejects cursors from another route, member, or role before I/O', async () => {
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) => {
+        const url = new URL(request.url);
+        if (url.pathname === '/odata.svc/Business')
+          return Response.json({ d: { results: [businessRow], __count: '2' } });
+        const older = url.searchParams.get('$filter')?.includes('BusinessNumber lt');
+        return Response.json({ d: [roleRow(1, older ? 20991233 : 20991234)] });
+      },
+    });
+    const issue = async (input: Record<string, unknown>) =>
+      businessNextCursor(await runToolContract(searchBusinessTool, { ...input, limit: 1 }));
+    const cursors = {
+      direct: await issue({}),
+      committee: await issue({ committeeId: '7' }),
+      member: await issue({ personNumber: '4102' }),
+      author: await issue({ personNumber: '4102', role: 'author' }),
+    };
+    const issued = http.calls.length;
+    for (const [cursor, input] of [
+      [cursors.committee, { personNumber: '4102' }],
+      [cursors.direct, { personNumber: '4102' }],
+      [cursors.member, { committeeId: '7' }],
+      [cursors.member, {}],
+      [cursors.member, { personNumber: '1156' }],
+      [cursors.member, { personNumber: '4102', role: 'author' }],
+      [cursors.author, { personNumber: '4102', role: 'cosignatory' }],
+      [cursors.author, { personNumber: '4102' }],
+    ] as const) {
+      const result = await runToolContract(searchBusinessTool, { ...input, limit: 1, cursor });
+      expect(result.structuredContent, JSON.stringify(input)).toMatchObject({
+        error: { code: JsonRpcErrorCode.ValidationError, data: { reason: 'invalid_cursor' } },
+      });
+    }
+    expect(http.calls).toHaveLength(issued);
+    const routed = JSON.parse(Buffer.from(cursors.member, 'base64url').toString());
+    const rerouted = Buffer.from(JSON.stringify({ ...routed, route: 'committee' })).toString(
+      'base64url',
+    );
+    const result = await runToolContract(searchBusinessTool, {
+      personNumber: '4102',
+      cursor: rerouted,
+    });
+    expect(result.structuredContent).toMatchObject({
+      error: { data: { reason: 'invalid_cursor' } },
+    });
+    expect(http.calls).toHaveLength(issued);
+  });
+
+  const year = { submittedFrom: '2026-01-01', submittedTo: '2026-12-31' };
+
+  it.each([
+    {
+      tagId: '12',
+      clause:
+        "(Tags eq '12' or startswith(Tags,'12|') or endswith(Tags,'|12') or substringof('|12|',Tags))",
+      included: ['12', '12|1216', '28|12', '4|12|28'],
+      excluded: ['28|1216', '1216', '112|212', '121', undefined],
+    },
+    {
+      tagId: '4',
+      clause:
+        "(Tags eq '4' or startswith(Tags,'4|') or endswith(Tags,'|4') or substringof('|4|',Tags))",
+      included: ['4', '4|1221', '1221|4', '24|4|44'],
+      excluded: ['421', '44', '14|41', '24|44', undefined],
+    },
+  ])(
+    'matches tag $tagId as one whole Tags element with an exact total',
+    async ({ tagId, clause, included, excluded }) => {
+      const rows = [...included, ...excluded].map((Tags, index) => ({
+        ID: 20991240 - index,
+        Language: 'DE',
+        ...(Tags !== undefined && { Tags }),
+      }));
+      http.reset();
+      http.route({
+        match: () => true,
+        respond: (request) => {
+          const filter = new URL(request.url).searchParams.get('$filter') ?? '';
+          const matched = rows.filter((row) => tagFilterMatches(filter, row.Tags));
+          return Response.json({ d: { results: matched, __count: String(matched.length) } });
+        },
+      });
+      const result = await runToolContract(searchBusinessTool, { tagId, ...year, limit: 100 });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        businesses: rows.slice(0, included.length).map((row) => ({ businessId: String(row.ID) })),
+        effectiveFilters: { tagId, ...year },
+        returnedCount: included.length,
+        totalCount: included.length,
+        hasMore: false,
+      });
+      expect(requestShapes()).toEqual([
+        [
+          'Business',
+          `Language eq 'DE' and (SubmissionDate ge datetime'2026-01-01T00:00:00' and SubmissionDate le datetime'2026-12-31T23:59:59.999' and ${clause})`,
+          'allpages',
+          '100',
+        ],
+      ]);
+      expectBusinessParity(result);
+    },
+  );
+
+  it.each([
+    { tagId: '12' },
+    { tagId: '12', submittedFrom: '2026-01-01' },
+    { tagId: '12', submittedTo: '2026-12-31' },
+    { tagId: '12', sessionId: '5107' },
+    { tagId: '12', author: 'Bertschy' },
+    { tagId: '12', submittedFrom: '2024-01-01', submittedTo: '2025-01-01' },
+    { tagId: '12', submittedFrom: '2025-01-01', submittedTo: '2026-01-02' },
+  ])(
+    'requires a closed window of at most 366 days for direct tag search %o before I/O',
+    async (input) => {
+      const result = await runToolContract(searchBusinessTool, input);
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'tag_scope_required',
+            recovery: {
+              hint: 'Supply submittedFrom and submittedTo at most 366 days apart, or scope by committeeId or personNumber, then retry chparl_search_business.',
+            },
+          },
+        },
+      });
+      expect(textContent(result)).toContain('tag_scope_required');
+      expect(textContent(result)).toContain('at most 366 days apart');
+      expect(http.calls).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    { submittedFrom: '2024-01-01', submittedTo: '2024-12-31' },
+    { submittedFrom: '2025-01-01', submittedTo: '2026-01-01' },
+    { submittedFrom: '2026-03-01', submittedTo: '2026-03-01' },
+  ])('accepts a direct tag window of $submittedFrom to $submittedTo', async (window) => {
+    serve({ d: { results: [], __count: '0' } });
+    const result = await runToolContract(searchBusinessTool, { tagId: '9999', ...window });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      businesses: [],
+      totalCount: 0,
+      hasMore: false,
+      notice:
+        'No parliamentary business matched these filters. Use chparl_list_reference with topic business_types, statuses, sessions, committees, or tags to verify codes, or broaden chparl_search_business.',
+    });
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      input: { committeeId: '10', tagId: '15' },
+      owner: "CommitteeNumber eq 10 and Businesses/Language eq 'DE'",
+      count: null,
+    },
+    {
+      input: { personNumber: '1156', role: 'author', tagId: '2841' },
+      owner: "MemberCouncilNumber eq 1156 and Role eq 7 and Businesses/Language eq 'DE'",
+      count: 'allpages',
+    },
+  ])(
+    'runs tagId through Businesses/Tags on role routes without a window',
+    async ({ input, owner, count }) => {
+      serveRoles([roleRow(1, 20991234), roleRow(2, 20991233)]);
+      const result = await runToolContract(searchBusinessTool, { ...input, limit: 1 });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        businesses: [{ businessId: '20991234' }],
+        hasMore: true,
+      });
+      const tag = input.tagId;
+      const clause = `(Businesses/Tags eq '${tag}' or startswith(Businesses/Tags,'${tag}|') or endswith(Businesses/Tags,'|${tag}') or substringof('|${tag}|',Businesses/Tags))`;
+      expect(requestShapes()).toEqual([
+        ['BusinessRole', `Language eq 'DE' and (${owner} and ${clause})`, count, '1'],
+        ['Business', expect.stringContaining('ID eq 20991234'), 'allpages', '1'],
+        [
+          'BusinessRole',
+          `Language eq 'DE' and (${owner} and ${clause} and BusinessNumber lt 20991234)`,
+          null,
+          '1',
+        ],
+      ]);
+      expect(tagFilterMatches(clause, tag)).toBe(true);
+      expect(tagFilterMatches(clause, `${tag}1`)).toBe(false);
+    },
+  );
+
+  it('keeps a maximum-width member, role, tag, and code search within the source query limit', async () => {
+    const max = '2147483647';
+    serveRoles([roleRow(1, 2_147_483_647), roleRow(2, 2_147_483_646)]);
+    const result = await runToolContract(searchBusinessTool, {
+      personNumber: max,
+      role: 'successor',
+      tagId: max,
+      typeId: max,
+      statusId: max,
+      sessionId: max,
+      ...year,
+      limit: 1,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(requestShapes().map(([path]) => path)).toEqual([
+      'BusinessRole',
+      'Business',
+      'BusinessRole',
+    ]);
+    for (const { request } of http.calls)
+      expect(new URL(request.url).search.length - 1).toBeLessThanOrEqual(1024);
+  });
+
+  it('binds tagId into the cursor and rejects a cursor from another tag before I/O', async () => {
+    serve({ d: { results: [businessRow], __count: '2' } });
+    const tagged = businessNextCursor(
+      await runToolContract(searchBusinessTool, { tagId: '12', ...year, limit: 1 }),
+    );
+    const untagged = businessNextCursor(
+      await runToolContract(searchBusinessTool, { ...year, limit: 1 }),
+    );
+    const issued = http.calls.length;
+    for (const [cursor, input] of [
+      [tagged, { tagId: '15', ...year }],
+      [tagged, year],
+      [untagged, { tagId: '12', ...year }],
+    ] as const) {
+      const result = await runToolContract(searchBusinessTool, { ...input, limit: 1, cursor });
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason: 'invalid_cursor' } },
+      });
+    }
+    expect(http.calls).toHaveLength(issued);
+    const continued = await runToolContract(searchBusinessTool, {
+      tagId: '12',
+      ...year,
+      limit: 1,
+      cursor: tagged,
+    });
+    expect(continued.isError).not.toBe(true);
+    expect(new URL(http.calls[issued]?.request.url ?? '').searchParams.get('$filter')).toContain(
+      "substringof('|12|',Tags)) and ID lt 20991234",
+    );
+  });
+
+  it('reports a direct tag total on the first page only and continues with one counted page request', async () => {
+    const ids = [20991240, 20991239, 20991238, 20991237, 20991236];
+    const rows = ids.map((ID) => ({ ...businessRow, ID, Tags: '12|1216' }));
+    http.reset();
+    http.route({
+      match: () => true,
+      respond: (request) => {
+        const url = new URL(request.url);
+        const filter = url.searchParams.get('$filter') ?? '';
+        const after = /ID lt (\d+)/.exec(filter)?.[1];
+        const selected = rows.filter(
+          (row) =>
+            tagFilterMatches(filter, row.Tags) && (after === undefined || row.ID < Number(after)),
+        );
+        const results = selected.slice(0, Number(url.searchParams.get('$top')));
+        return Response.json({
+          d: url.searchParams.has('$inlinecount')
+            ? { results, __count: String(selected.length) }
+            : results,
+        });
+      },
+    });
+    const input = { tagId: '12', ...year, limit: 2 };
+    const first = await runToolContract(searchBusinessTool, input);
+    const second = await runToolContract(searchBusinessTool, {
+      ...input,
+      cursor: businessNextCursor(first),
+    });
+    const third = await runToolContract(searchBusinessTool, {
+      ...input,
+      cursor: businessNextCursor(second),
+    });
+    expect(first.structuredContent).toMatchObject({
+      businesses: [{ businessId: '20991240' }, { businessId: '20991239' }],
+      returnedCount: 2,
+      totalCount: 5,
+      hasMore: true,
+    });
+    expect(second.structuredContent).toMatchObject({
+      businesses: [{ businessId: '20991238' }, { businessId: '20991237' }],
+      returnedCount: 2,
+      hasMore: true,
+    });
+    expect(second.structuredContent).not.toHaveProperty('totalCount');
+    expect(third.structuredContent).toMatchObject({
+      businesses: [{ businessId: '20991236' }],
+      returnedCount: 1,
+      hasMore: false,
+    });
+    expect(third.structuredContent).not.toHaveProperty('totalCount');
+    expect(third.structuredContent).not.toHaveProperty('nextCursor');
+    // The cursor is filter-bound but can outlive source deletions.
+    rows.length = 0;
+    const past = await runToolContract(searchBusinessTool, {
+      ...input,
+      cursor: businessNextCursor(second),
+    });
+    expect(past.structuredContent).toMatchObject({ businesses: [], hasMore: false });
+    expect(past.structuredContent).not.toHaveProperty('totalCount');
+    expect(past.structuredContent).not.toHaveProperty('nextCursor');
+    expect(textContent(past)).toContain('No business remains after this cursor');
+    const scope =
+      "SubmissionDate ge datetime'2026-01-01T00:00:00' and SubmissionDate le datetime'2026-12-31T23:59:59.999' and (Tags eq '12' or startswith(Tags,'12|') or endswith(Tags,'|12') or substringof('|12|',Tags))";
+    expect(requestShapes()).toEqual([
+      ['Business', `Language eq 'DE' and (${scope})`, 'allpages', '2'],
+      ['Business', `Language eq 'DE' and (${scope} and ID lt 20991239)`, 'allpages', '2'],
+      ['Business', `Language eq 'DE' and (${scope} and ID lt 20991237)`, 'allpages', '2'],
+      ['Business', `Language eq 'DE' and (${scope} and ID lt 20991237)`, 'allpages', '2'],
+    ]);
+    for (const result of [first, second, third, past]) expectBusinessParity(result);
   });
 });
