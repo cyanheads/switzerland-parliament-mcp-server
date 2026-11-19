@@ -31,7 +31,7 @@
 
 Swiss Federal Assembly records from Curia Vista and the Amtliches Bulletin. Find parliamentary business, read its original texts and procedural history, follow the debate in either council, inspect Nationalrat roll calls, and look up members and declared interests. Uses the [public OData service](https://ws.parlament.ch/odata.svc/) without an API key; runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
 
-Ships the `switzerland-parliament-guide` agent skill (`skill://switzerland-parliament-guide/SKILL.md`), which plugin installs and MCP clients read for the checks that span tools: choosing which roll call to report, tracing a Bulletin vote announcement to its roll call, what the Ständerat record holds, and committee rosters that show only the current composition.
+Ships the `switzerland-parliament-guide` agent skill (`skill://switzerland-parliament-guide/SKILL.md`), which plugin installs and MCP clients read for the checks that span tools: choosing which roll call to report, tracing a Bulletin vote announcement to its roll call, what the Ständerat record holds, and committee rosters, which are current by default and past-day through `asOf`.
 
 Results credit **Parlamentsdienste der Bundesversammlung, Bern**, with source URLs and download dates. This is an unofficial reproduction. The [Parliament's open-data conditions](https://www.parlament.ch/de/%C3%BCber-das-parlament/fakten-und-zahlen/open-data-web-services) apply to source content; underlying author rights remain intact.
 
@@ -39,20 +39,21 @@ Results credit **Parlamentsdienste der Bundesversammlung, Bern**, with source UR
 
 | Tool | Description |
 |:---|:---|
-| `chparl_search_business` | Find business by title, submitter, type, status, submission session, dates, or committee role |
+| `chparl_search_business` | Find business by title, submitter, type, status, submission session, dates, topic tag, committee role, or a member's own roles |
 | `chparl_get_business` | Read business metadata, original texts, status history, bills, related business, committee consultations, or debate subjects |
 | `chparl_get_votes` | Find Nationalrat roll calls, page member decisions, or read complete vote and parliamentary-group counts |
 | `chparl_search_transcripts` | Find debate passages by business, subject, speaker, session, council, or dates; retrieve original text |
-| `chparl_search_members` | Find current or former parliamentary affiliation records by name, council, canton, party, or group, or list a committee's current members |
-| `chparl_get_member` | Read parliamentary identity, council terms, committee memberships, or declared interests |
-| `chparl_list_reference` | Resolve identifiers, coverage, languages, codes, committees, and sessions |
+| `chparl_search_members` | Find current or former parliamentary affiliation records by name, council, canton, party, or group, list a committee's current members or its members on a past day, or find the members who declare an interest |
+| `chparl_get_member` | Read parliamentary identity, council terms, current committee memberships, committee history, or declared interests |
+| `chparl_list_reference` | Resolve identifiers, coverage, languages, codes, committees, topic tags, and sessions |
 
 ## Capability reference
 
 ### `chparl_search_business` <sub>tool</sub>
 
-- `query` (title substring), `author` (published submitter label, not every co-signatory), `typeId`, `statusId`, `sessionId` (submission session), `committeeId`, and inclusive `submittedFrom` / `submittedTo`. Newest business IDs first, default 20/max 100. Text too long for the source's 2,048-byte URL-encoded query string fails as `request_too_long` instead of being sent
-- Continue with `nextCursor` and unchanged filters; a cursor from other filters fails as `invalid_cursor`. `totalCount` is reported only without author or committee filters. Author searches use an extra matching row to establish continuation; committee searches page role candidates, so pages can be short
+- `query` (title substring), `author` (published submitter label, not every co-signatory), `typeId`, `statusId`, `sessionId` (submission session), `committeeId`, `personNumber`, `role`, `tagId`, and inclusive `submittedFrom` / `submittedTo`. Newest business IDs first, default 20/max 100. Text too long for the source's 2,048-byte URL-encoded query string fails as `request_too_long` instead of being sent
+- `personNumber` lists the business where that member holds a published role, former members and co-signatures included, and cannot combine with `committeeId`. `role` (`author`, `cosignatory`, `spokesperson`, `opponent`, `successor`) narrows it to one role and requires `personNumber`. `tagId` (a `chparl_list_reference` topic `tags` id) matches one whole element of a business's tags; without `committeeId` or `personNumber` it needs `submittedFrom` and `submittedTo` at most 366 days apart, or fails as `tag_scope_required`
+- Continue with `nextCursor` and unchanged filters; a cursor from other filters fails as `invalid_cursor`. `totalCount` is reported without author or committee filters, and with `personNumber` plus `role`; a `tagId` search without `committeeId` or `personNumber` reports it on the first page only. Author searches use an extra matching row to establish continuation; committee searches, and `personNumber` searches without `role`, page role rows, so pages can be short
 
 ---
 
@@ -60,14 +61,14 @@ Results credit **Parlamentsdienste der Bundesversammlung, Bern**, with source UR
 
 - Canonical eight-digit `businessId` or an exact published short number such as `99.1234`. A short number matching several businesses fails as `ambiguous_business_number`, and a miss returns `found: false`
 - `overview` (default) returns metadata and `availableTextFields` with UTF-8 sizes. `texts` returns `textDocument.kind: "full" | "outline"`: several large fields become an outline, and named `textFields` always return whole
-- `status_history`, `bills`, `related_business`, `preconsultations`, and `subjects` page independently, default 20/max 100 with `nextOffset`. `subjects` IDs narrow `chparl_search_transcripts`; linked bills are parliamentary records, not enacted law
+- `status_history`, `bills`, `related_business`, `preconsultations`, and `subjects` page independently, default 20/max 100 with `nextOffset`. `subjects` rows carry the `meetingDate`, `councilName`, `sessionId`, and `sessionName` of their meeting, and their IDs narrow `chparl_search_transcripts`; linked bills are parliamentary records, not enacted law
 
 ---
 
 ### `chparl_get_votes` <sub>tool</sub>
 
-- `mode: "votes"` with `businessId`, `sessionId`, or both lists roll calls (default 10/max 50). A returned `voteId` feeds `mode: "members"` (default 50/max 100, optional `personNumber`) or `mode: "groups"` (unpaged). Paged modes continue with `nextOffset`
-- `mode: "members"` with `personNumber` and no `voteId` pages that member's voting history, optionally narrowed by `businessId` and `sessionId`. Each history row carries its published vote, business, session, and time fields; selected-vote pages carry that context once in `vote`. `cantonId` uses the canton reference's numbering; `votingCantonId` preserves the source Voting identifier
+- `mode: "votes"` with `businessId`, `sessionId`, or both lists roll calls (default 10/max 50). A returned `voteId` feeds `mode: "members"` (default 25/max 100, optional `personNumber`) or `mode: "groups"` (unpaged). Paged modes continue with `nextOffset`
+- `mode: "members"` with `personNumber` and no `voteId` pages that member's voting history, optionally narrowed by `businessId` and `sessionId`. Each history row carries its published vote, business, session, and time fields plus `billTitle`, `registrationNumber`, `subject`, `meaningYes`, and `meaningNo`; a Bulletin vote passage's `voteId` is the `registrationNumber`. Selected-vote pages carry that context once in `vote`. `cantonId` uses the canton reference's numbering; `votingCantonId` preserves the source Voting identifier
 - `members` counts carry `decisionCounts.scope: "page"`. `groups` reads every published member row and returns `scope: "vote"`, `complete: true`, and per-group totals by the affiliation recorded on the vote. Count buckets retain every distinct published label in `decisionTexts`. Decision codes: 1 yes, 2 no, 3 abstention, 4 present, 5 did not participate, 6 excused under Art. 57 para. 4, 7 president does not vote, 8 resigned
 - **Nationalrat only, from the 2003 winter session.** An empty result does not establish that no vote occurred
 
@@ -76,31 +77,34 @@ Results credit **Parlamentsdienste der Bundesversammlung, Bern**, with source UR
 ### `chparl_search_transcripts` <sub>tool</sub>
 
 - Both councils from the **1999 winter session**. Scope with `businessId` or `subjectId` (exclusive), `personNumber`, `sessionId`, or a date bound; `council` only narrows. `query` (original-text substring) also needs `sessionId` or a closed range of at most **31 calendar days**, and text too long for the source's 2,048-byte URL-encoded query string fails as `request_too_long`
-- Metadata with `textSizeBytes` by default (20/max 100); `includeText: true` returns whole passages (3/max 10); an exact `transcriptId` defaults to full text. Continue with `nextOffset`
-- A business search covers up to 20 debate subjects; more fails as `business_scope_too_broad`, so page `chparl_get_business` section `subjects` and pass one `subjectId`. `found` marks exact-ID misses, `scopeFound` a missing business
+- Metadata with `textSizeBytes` by default (20/max 100); `includeText: true` returns whole passages (3/max 10); an exact `transcriptId` defaults to full text. Searches run in debate order, oldest first: meeting day, sitting, debate subject, then `sortOrder` within the subject. Continue with `nextOffset`
+- A business search covers up to 20 debate subjects. A business with more is searched when `council`, `sessionId`, `dateFrom`, or `dateTo` leave at most 20 of its subjects; otherwise it fails as `business_scope_too_broad`, so page `chparl_get_business` section `subjects` and pass one `subjectId`. `found` marks exact-ID misses, `scopeFound` a missing business
 - `subjectBusinesses` maps each delivered passage's `subjectId` to the businesses published for that debate subject, whose `businessId` feeds `chparl_get_business` and `chparl_get_votes`. A passage's own `businessId` comes only from vote announcements. When that lookup fails for any upstream reason or outlasts its 10-second bound, the field is omitted with a notice and the passages are unchanged
 
 ---
 
 ### `chparl_search_members` <sub>tool</sub>
 
-- `query` (first, last, or official name substring), `membership` (`current` default, `former`, `all`), `council` (`N`/`S` or the German, French, or Italian council name), `cantonId`, `partyId`, `groupId`, `committeeId`. Default 20/max 100, `nextOffset`. `query` too long for the source's 2,048-byte URL-encoded query string fails as `request_too_long`
-- Rows are **MemberCouncil affiliation records**, not deduplicated people. Their `personNumber`, which need not equal `Person.ID`, feeds `chparl_get_member`, `chparl_get_votes`, and `chparl_search_transcripts`
-- `committeeId` (a `chparl_list_reference` topic `committees` id) lists that committee's current members: one row per membership, with `committeeFunctionId`/`committeeFunctionName`, and `totalCount` counting memberships. The other filters narrow the roster; a sub-committee has its own number and roster. Rosters are current composition only, so `membership` `former` or `all` fails as `incompatible_fields`. `committeeFound: false` with `guidance` marks an unknown committee; a committee with no published members returns `committeeFound: true` and an empty roster
+- `query` (first, last, or official name substring), `membership` (`current` default, `former`, `all`), `council` (`N`/`S` or the German, French, or Italian council name), `cantonId`, `partyId`, `groupId`, `committeeId`, `asOf`, `interest`. Default 20/max 100, `nextOffset`. `query` or `interest` too long for the source's 2,048-byte URL-encoded query string fails as `request_too_long`
+- Rows are **MemberCouncil affiliation records**, not deduplicated people. Current records include the Federal Council (`councilId` 99) and the Federal Chancellor (98) beside the parliamentarians. Their `personNumber` feeds `chparl_get_member`, `chparl_get_votes`, `chparl_search_business`, and `chparl_search_transcripts`
+- `committeeId` (a `chparl_list_reference` topic `committees` id) lists that committee's current members: one row per membership, with `committeeFunctionId`/`committeeFunctionName`, and `totalCount` counting memberships. The other filters narrow the roster; a sub-committee has its own number and roster. Rosters take `membership` `current` only, so `former` or `all` fails as `incompatible_fields`. `committeeFound: false` with `guidance` marks an unknown committee; a committee with no published members returns `committeeFound: true` and an empty roster
+- `asOf` (with `committeeId`; `YYYY-MM-DD`, a date-time read as its day, no future day) lists the memberships open on that day, a membership's last day included, so a person whose function changed that day holds two rows. Rows carry the names, council, canton, party, and group recorded for that membership, with `committeeJoinedDate` and `committeeLeftDate` (which can lie in the future); `council`, `cantonId`, `partyId`, and `groupId` filter that recorded affiliation. Published history starts per committee, 1995-12-04 for standing committees. A day after today in Switzerland fails as `as_of_in_future`
+- `interest` (a substring of a declared interest name, case- and accent-insensitive, never translated between languages) returns one row per matching declaration: the declarant's member record plus its `interest`, with `totalCount` counting declarations. It cannot combine with `committeeId` or `asOf`; `membership` applies to the declarant's record. An empty result does not establish that no member has a tie to the organisation
 
 ---
 
 ### `chparl_get_member` <sub>tool</sub>
 
 - Requires `personNumber`. `overview` (default) returns identity and every MemberCouncil affiliation, unpaged; a miss returns `found: false`
-- `council_terms`, `committees`, and `interests` page independently, default 20/max 100 with `nextOffset`. Committee rows are published memberships, not a historical ledger. A missing `paid` flag means unknown, and empty interests do not establish the absence of conflicts
+- `council_terms`, `committees`, `committee_history`, and `interests` page independently, default 20/max 100 with `nextOffset`. `committees` holds current memberships; `committee_history` is the ledger of every published committee membership, past and current, oldest first, each with the council recorded for it and its first and last day. A missing `paid` flag means unknown, and empty interests do not establish the absence of conflicts
 
 ---
 
 ### `chparl_list_reference` <sub>tool</sub>
 
-- Static topics `identifiers`, `coverage`, `languages`, and `statuses` (the official vocabulary effective 1 July 2023, each code tagged `era: "legacy" | "current"`). Live dictionaries `business_types`, `councils`, `cantons`, `parties`, `groups`, `committees`, and `sessions`
+- Static topics `identifiers`, `coverage`, `languages`, and `statuses` (the official vocabulary effective 1 July 2023, each code tagged `era: "legacy" | "current"`). Live dictionaries `business_types`, `tags`, `councils`, `cantons`, `parties`, `groups`, `committees`, and `sessions`; a `tags` id feeds `chparl_search_business` `tagId`
 - Default 50/max 100, `nextOffset`. Only `sessions` accepts dates: `dateFrom` bounds the start and `dateTo` the end, inclusively
+- `query` filters `committees`, `parties`, and `groups` by a case- and accent-insensitive substring of each entry's label or abbreviation in the selected metadata language; abbreviations differ by language (`WAK-N` is `CER-N` in `fr`). With it, `totalCount`, `nextOffset`, and `hasMore` describe the filtered set. On another topic it fails as `incompatible_fields`
 
 ## Features
 
@@ -116,7 +120,7 @@ Swiss Parliament-specific:
 Agent-friendly output:
 
 - Provenance on every result: attribution to Parlamentsdienste der Bundesversammlung, plus the source URL and retrieval time of each upstream response
-- Whole-record pages: replies fit a 24,000-byte budget by returning fewer records, never shorter fields, and report `returnedCount`, `hasMore`, `totalCount` when known, and the continuation
+- Whole-record pages: a page holds the requested `limit` records (clamped to the tool's cap with a notice), never shorter fields, and reports `returnedCount`, `hasMore`, `totalCount` when known, and the continuation
 - One record on both surfaces: `content[]` carries every `structuredContent` field, with multiline text and HTML in JSON-encoded fenced blocks that decode back losslessly
 - Unknown stays unknown: absent source values are omitted rather than defaulted, empty results carry next-step guidance, and failures carry typed reasons such as `upstream_rate_limited`
 
@@ -211,7 +215,7 @@ The image defaults to HTTP transport, stateless sessions, and logs to `/var/log/
 |:---|:---|
 | `skills/` | The published `switzerland-parliament-guide` agent skill, served over MCP and shipped in the package, the `.mcpb` bundle, and the Docker image. |
 | `src/index.ts` | `createApp()` entry point and service setup; seven tools and the published skill, no domain resources or prompts. |
-| `src/mcp-server/tools` | Tool definitions, shared lossless rendering, and whole-record page fitting. |
+| `src/mcp-server/tools` | Tool definitions, shared lossless rendering, and single-record size notices. |
 | `src/services/parliament` | OData client, workflow deadlines, domain schemas and services, provenance, and reference snapshots. |
 | `tests/` | Unit and integration tests, mirroring the `src/` structure. |
 

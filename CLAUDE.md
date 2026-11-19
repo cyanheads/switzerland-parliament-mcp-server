@@ -48,7 +48,7 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 All seven tools are read-only, idempotent public-source lookups. Definitions live in `src/mcp-server/tools/definitions/`, register directly in `src/index.ts`, and use `chparl_` names.
 
-`chparl_search_business` discovers canonical IDs; `chparl_get_business` reads one section at a time. `chparl_get_votes` discovers roll calls by business/session, reads a person's voting history directly, or selects a roll call for member decisions and complete group counts. `chparl_search_transcripts` joins business through debate subjects and maps delivered passages back through a best-effort `subjectBusinesses` lookup (batched by encoded length, its own 10-second bound, degrading with a notice on any upstream failure; only cancellation, the workflow deadline, or a programmer error fail the call). Member workflows use `PersonNumber`, never assume it equals `Person.ID`. `chparl_search_members` with `committeeId` pages that committee's current `MemberCommittee` memberships through the `MembersCouncil` expansion; `membership` `former`/`all` fails as `incompatible_fields`, and `committeeFound` separates an unknown committee from an empty roster.
+`chparl_search_business` discovers canonical IDs by title, submitter, topic `tagId`, committee role, or a member's `personNumber` and `role` (the role routes read `BusinessRole`); `chparl_get_business` reads one section at a time, and its `subjects` rows carry their meeting's date, council, and session. `chparl_get_votes` discovers roll calls by business/session, reads a person's voting history directly (rows carry the roll call's subject and yes/no meanings), or selects a roll call for member decisions and complete group counts. `chparl_search_transcripts` runs in debate order and joins business through debate subjects, re-reading a business over 20 subjects against the call's `council`, `sessionId`, and date bounds before refusing it; it maps passages back through a best-effort `subjectBusinesses` lookup (batched by encoded length, its own 10-second bound, degrading with a notice on any upstream failure; only cancellation, the workflow deadline, or a programmer error fail the call). Member workflows use `PersonNumber`, the key `Person`, `MemberCouncil`, and `BusinessRole.MemberCouncilNumber` share. `chparl_search_members` with `committeeId` pages that committee's current `MemberCommittee` memberships through the `MembersCouncil` expansion; `membership` `former`/`all` fails as `incompatible_fields`, and `committeeFound` separates an unknown committee from an empty roster. With `asOf` it reads `MemberCommitteeHistory` for the roster on a past day, and `interest` searches `PersonInterest` declarations instead of affiliations. `chparl_get_member` section `committees` holds current memberships and `committee_history` the past-and-current ledger.
 
 `chparl_list_reference` resolves source codes before discovery. For example:
 
@@ -56,16 +56,16 @@ All seven tools are read-only, idempotent public-source lookups. Definitions liv
 {"topic":"sessions","language":"fr","limit":50}
 ```
 
-Its definition validates topic-specific dates, resolves effective filters, calls `getParliamentService().listReference` inside `withWorkflow`, fits complete rows with `fitCollectionPage`, and publishes the prepared enrichment through `ctx.enrich`. Declare enrichment as one `EnrichmentSchema` object and pass `enrichmentTrailer: fieldTrailer(EnrichmentSchema.shape)`, so every trailer field renders through `renderField`. That, with `formatParliamentResult` for the domain block, keeps byte measurement equal to the actual output. Build notices with `joinNotices`, `clampNotice`, and `isPastEnd` from `parliament-format.ts`. Keep every field and enrichment value on both `content[]` and `structuredContent`.
+Its definition validates topic-specific dates and `query`, resolves effective filters, calls `getParliamentService().listReference` inside `withWorkflow`, and publishes the enrichment through `ctx.enrich`. Declare enrichment as one `EnrichmentSchema` object and pass `enrichmentTrailer: fieldTrailer(EnrichmentSchema.shape)`, so every trailer field renders through `renderField`. That, with `formatParliamentResult` for the domain block, keeps `completeResultBytes` equal to the actual output. Build notices with `joinNotices`, `clampNotice`, and `isPastEnd` from `parliament-format.ts`. Keep every field and enrichment value on both `content[]` and `structuredContent`.
 
 ### Source fidelity and pagination
 
 - Metadata language is `de`, `fr`, or `it`; it never translates Bulletin text. Preserve source strings, HTML, line endings, unknown codes, and absent values.
 - Every successful result carries `provenance` with attribution, source URLs, and actual download or snapshot dates.
-- Collection pages fit whole rows to the 24,000-byte complete-result budget. Preserve an indivisible oversized row with a notice; never shorten fields.
+- A collection page holds `min(limit, cap)` whole rows; the caller sizes a response through `limit`, never a server-side byte budget, and fields are never shortened. The 24,000-byte `WHOLE_RESULT_NOTICE_BYTES` in `parliament-format.ts`, measured with `completeResultBytes`, only triggers the single-record size notices: the business texts outline, the member overview, the votes groups aggregate, and an exact transcript passage.
 - The source serves URL-encoded query strings of at most 2,048 bytes; `ODataClient` refuses a longer request before dispatch as ValidationError `request_too_long`. Every server-built ID list must fit at maximum ID width.
 - Each `chparl_get_business` relationship array has its own row schema picking exactly the fields its section's `$select` lets the mapping emit, in the superset's key order; a mapped field missing from its pick is dropped from both surfaces.
-- Business searches continue with `nextCursor`; other paged sections use `nextOffset` based on delivered rows. Author searches omit counts and use one extra matching row; committee pages count role candidates and omit a distinct business total.
+- Business searches continue with `nextCursor`; other paged sections use `nextOffset` based on delivered rows. Author searches omit counts and use one extra matching row; committee pages, and `personNumber` pages without `role`, count role rows and omit a distinct business total, while one `role` reports an exact `totalCount`. A `tagId` search without `committeeId` or `personNumber` needs a submission-date window of at most 366 days and reports `totalCount` on its first page only: a continuation sends just its counted page request, never a recount.
 - Vote rows use canonical `CantonNumber` for `cantonId` and retain source `Voting.CantonID` as `votingCantonId`. Decision buckets preserve all distinct published labels in `decisionTexts`, including unknown codes.
 - Business text selection returns whole named fields; automatic overflow can return `textDocument.kind: "outline"`. Member page counts have `scope: "page"`; complete vote/group counts require `mode: "groups"`.
 - No domain environment variables, credentials, domain resources, prompts, persistent cache, or background tasks are required; the only resources are the published skill's `skill://` files, served by the SDK.
@@ -131,7 +131,7 @@ src/
   index.ts                              # createApp() registration and setup
   mcp-server/tools/
     definitions/                        # Seven chparl_ tool definitions
-    parliament-format.ts                # Lossless rendering and whole-row fitting
+    parliament-format.ts                # Lossless rendering and single-record size notices
   services/parliament/                   # Domain schemas/services, OData client,
                                         # deadlines, provenance, static references
 tests/
@@ -232,6 +232,8 @@ Available skills:
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/<major.minor>.x/<version>.md` |
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
+
+**Dependency hold:** `vitest` and `@vitest/coverage-istanbul` stay pinned at exactly `5.1.0` (both in `devcheck.config.json` `outdated.allowlist`). Under 5.1.1 the forks pool calls `child.channel.unref()`, which Bun's `child_process` lacks, so every forked test file fails to start on the Bun lane (`bun --bun run test`). Re-check each new vitest release on that lane and drop the hold once it passes.
 
 **CI is one file.** `.github/workflows/codeql.yml` (scaffolded) is the only GitHub Actions workflow: CodeQL is GitHub-owned end to end, and the file runs only while the repo's CodeQL *default setup* is turned off. Verification — `devcheck`, tests, the release gates — runs locally; don't add a workflow that re-runs it.
 
